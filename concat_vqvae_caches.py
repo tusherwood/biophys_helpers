@@ -18,6 +18,16 @@ of sources, so the outputs cannot drift, and it adds three columns to every row:
     sample_name   the sample subdir the row came from
     cache_row     the row's index into the concatenated tensor
 
+It also makes cell_id globally unique. Each source numbers its cells from 1, so
+the bare ids collide between samples; in the output, cell_id is the string
+'<sample_name>_<cell_id>' (e.g. 'normox-pbs_12') and the source's original
+value is kept beside it as cell_id_source. That id is exactly the one
+VAEImagingAnalysis' cell-ID train/val split and per-cell clustering key off, so
+a merged cache feeds it directly. cell_id_source is the key back to the
+CELLGROUPED hdf5's per-cell tables and to the pair_cell_id / vol_cell_id
+columns of compile_experiment.py's per-sample sheets. Ids are unique only while
+sample names are: merging two experiments that share a sample name warns.
+
 Caches are found under the layout the other aggregators in this repo walk:
 
     <superdir>/<sample>/<YYYYMMDD.HHMMSS>_imaging_fxm_results/
@@ -67,6 +77,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from fsutil import is_appledouble
@@ -95,6 +106,12 @@ _LABEL_EXPERIMENT = 'experiment'
 _LABEL_SAMPLE     = 'sample_name'
 _LABEL_ROW        = 'cache_row'
 _ADDED_COLUMNS    = (_LABEL_EXPERIMENT, _LABEL_SAMPLE, _LABEL_ROW)
+
+# The per-cell id. Rewritten to '<sample_name>_<cell_id>' (a string) so it is
+# unique across the merge; the source value is kept under _CELL_ID_SOURCE,
+# placed right after it. The format matches what VAEImagingAnalysis expects.
+_CELL_ID          = 'cell_id'
+_CELL_ID_SOURCE   = 'cell_id_source'
 
 # Matches the timestamp prefix on a run directory. SMRFXMAnalysis's
 # imaging_fxm_results dirs are dot-separated (YYYYMMDD.HHMMSS) only -- there is
@@ -682,6 +699,9 @@ def _union_schema(sources: list[CacheSource]) -> tuple[pa.Schema, dict]:
     write_concat_parquet for a mixed BF-only + BF+FL experiment where a
     BF-only sample happens to sort first). Returns (schema, {column: [labels
     lacking it]}) so the caller can report what was null-filled.
+
+    cell_id is always a string in the output (see the module docstring); the
+    type collected for it here is the source type, which cell_id_source keeps.
     """
     order: list[str] = []
     seen: dict[str, pa.DataType] = {}
@@ -705,7 +725,13 @@ def _union_schema(sources: list[CacheSource]) -> tuple[pa.Schema, dict]:
         if lacking:
             missing[name] = lacking
 
-    fields = [pa.field(name, seen[name]) for name in order]
+    fields = []
+    for name in order:
+        if name == _CELL_ID:
+            fields.append(pa.field(_CELL_ID, pa.string()))
+            fields.append(pa.field(_CELL_ID_SOURCE, seen[name]))
+        else:
+            fields.append(pa.field(name, seen[name]))
     fields.append(pa.field(_LABEL_EXPERIMENT, pa.string()))
     fields.append(pa.field(_LABEL_SAMPLE, pa.string()))
     fields.append(pa.field(_LABEL_ROW, pa.int64()))
@@ -718,8 +744,24 @@ def _renamed(column: str) -> str:
 
     A source that already has an `experiment` column would otherwise be
     overwritten by the label; suffix it instead so upstream data survives.
+    cell_id_source is taken by the original cell_id, so a source column of
+    that name is suffixed the same way.
     """
-    return f'{column}_source' if column in _ADDED_COLUMNS else column
+    if column in _ADDED_COLUMNS or column == _CELL_ID_SOURCE:
+        return f'{column}_source'
+    return column
+
+
+def _unique_cell_id(raw: pa.Array, sample_name: str) -> pa.Array:
+    """
+    '<sample_name>_<cell_id>' for every row; a null id stays null.
+
+    Mirrors VAEImagingAnalysis' own correction (polars: sample_name + "_" +
+    cell_id.cast(Utf8)), so an integer id 12 becomes 'sample_12'.
+    """
+    ids = pc.cast(raw, pa.string())
+    prefix = pa.array([sample_name] * len(ids), type=pa.string())
+    return pc.binary_join_element_wise(prefix, ids, '_')
 
 
 def write_concat_parquet(sources: list[CacheSource], out_path: Path,
@@ -761,6 +803,13 @@ def write_concat_parquet(sources: list[CacheSource], out_path: Path,
                         elif field.name == _LABEL_ROW:
                             columns.append(pa.array(
                                 range(written, written + n), type=pa.int64()))
+                        elif field.name == _CELL_ID and _CELL_ID in present:
+                            columns.append(_unique_cell_id(
+                                present[_CELL_ID], src.sample_name))
+                        elif field.name == _CELL_ID_SOURCE and _CELL_ID in present:
+                            col = present[_CELL_ID]
+                            columns.append(col if col.type == field.type
+                                           else col.cast(field.type))
                         elif field.name in present:
                             col = present[field.name]
                             columns.append(col if col.type == field.type
@@ -902,9 +951,22 @@ def plan_concat(sources: list[CacheSource], requested_keys: str | None = None,
              f'null-filled ({", ".join(lacking[:3])}'
              f'{" ..." if len(lacking) > 3 else ""})')
     for column in sorted({c for s in usable for c in s.columns
-                          if c in _ADDED_COLUMNS}):
+                          if _renamed(c) != c}):
         note(f'source column {column!r} kept as {column}_source '
-             f'(the label column takes that name)')
+             f'(an added column takes that name)')
+
+    # cell_id is namespaced by sample_name alone (the format VAEImagingAnalysis
+    # expects), so it is only unique while sample names are. Two experiments
+    # merged here can share a sample name; say so rather than let their cells
+    # silently share ids.
+    experiments_by_sample: dict[str, list[str]] = {}
+    for src in usable:
+        experiments_by_sample.setdefault(src.sample_name, []).append(src.experiment)
+    for sample, experiments in sorted(experiments_by_sample.items()):
+        if len(experiments) > 1:
+            log(f'  [warn] sample name {sample!r} occurs in {len(experiments)} '
+                f'sources ({", ".join(experiments)}): their cell_ids collide, '
+                f'so cells from different experiments will share an id')
 
     return ConcatPlan(usable, skipped, keys, schema)
 
@@ -941,9 +1003,9 @@ def summarize(plan: ConcatPlan, result: ConcatResult, n_sources: int,
         log(f'  {key:<8}{str(result.shapes[key]):<24}{info.dtype:<8}'
             f'{nbytes / (1024 * 1024):>9,.1f} MB')
     log(f'  {"rows":<8}{result.rows:,}')
+    n_added = len(_ADDED_COLUMNS) + (_CELL_ID_SOURCE in plan.schema.names)
     log(f'  {"columns":<8}{len(plan.schema.names)} '
-        f'({len(plan.schema.names) - len(_ADDED_COLUMNS)} source + '
-        f'{len(_ADDED_COLUMNS)} added)')
+        f'({len(plan.schema.names) - n_added} source + {n_added} added)')
 
     if result.problems:
         log('\n  [FAIL] output failed its own consistency check:')

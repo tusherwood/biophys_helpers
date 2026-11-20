@@ -878,8 +878,10 @@ blobs a chunk at a time, so it is flat in memory no matter how large the caches 
 the output can still be many gigabytes; `--no-vqvae` skips it.
 
 Which samples made it in is recorded in the metadata sheet's `has_vqvae` column, and the
-README sheet gains a read recipe. Join the parquet back to the workbook on `sample_name`,
-then use `cache_row` to index axis 0 of the tensors:
+README sheet gains a read recipe. Join the parquet back to the workbook on `sample_name`
+(and to a sheet's `pair_cell_id` / `vol_cell_id` on `cell_id_source`; the parquet's own
+`cell_id` is the globally unique `<sample_name>_<n>` form, see `concat_vqvae_caches.py`
+below), then use `cache_row` to index axis 0 of the tensors:
 
 ```python
 md   = pq.read_table('concat_vqvae_cache_metadata.parquet').to_pandas()
@@ -940,6 +942,18 @@ sources so they cannot drift, and adds three columns to every row:
 
 `cache_row` makes the correspondence explicit rather than merely implied, so it survives any
 later sort or filter of the parquet: `bf_u8[row.cache_row]` is always that row's crop.
+
+It also makes `cell_id` unique across the merge. Each source numbers its cells 1, 2, 3, … so
+the bare ids collide between samples; in the output `cell_id` is the string
+`<sample_name>_<cell_id>` (e.g. `normox-pbs_12`), and the original value is kept beside it:
+
+| Column | Meaning |
+|---|---|
+| `cell_id` | `<sample_name>_<n>`: unique across samples; what VAEImagingAnalysis' cell-ID split and per-cell clustering key on |
+| `cell_id_source` | the source's own per-sample id `n`: the key into the CELLGROUPED hdf5's per-cell tables, and what a compiled workbook's `pair_cell_id` / `vol_cell_id` hold |
+
+The ids are only unique while sample names are, so merging two experiments that share a
+sample name prints a warning.
 
 Caches are found under the same layout the other aggregators walk —
 `<superdir>/<sample>/<YYYYMMDD.HHMMSS>_imaging_fxm_results/` (or, for runs from before

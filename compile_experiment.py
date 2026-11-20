@@ -85,7 +85,13 @@ that is gone, so the field of view outside each crop is no longer compiled. The
 pair is written by concat_vqvae_caches.py, which is imported rather than shelled
 out to. Every row carries `experiment`, `sample_name` and `cache_row`, so
 `sample_name` joins the parquet back to the metadata sheet and `cache_row`
-indexes axis 0 of the tensors. Samples without a cache are simply absent;
+indexes axis 0 of the tensors. The parquet's `cell_id` is made unique across
+samples, as the string '<sample_name>_<cell_id>' (the form VAEImagingAnalysis
+keys its per-cell split and clustering on). The hdf5's own per-sample integer
+is kept as `cell_id_source`, which is what the workbook's pair_cell_id /
+vol_cell_id hold, so a crop joins to its sheet row on (sample_name,
+cell_id_source). Gating (_gate_cache_rows) reads the source parquets, so it
+still matches on the integer. Samples without a cache are simply absent;
 --no-vqvae skips the pair entirely.
 
 experiment_data.xlsx layout:
@@ -1469,6 +1475,13 @@ def _build_readme_df(timestamp: str, has_vqvae: bool = False) -> pd.DataFrame:
                             'Parquet row i describes tensor row i. Join back to '
                             'this workbook on sample_name; use cache_row to index '
                             'axis 0 of the tensors.'),
+            ('cache cell ids',
+                            'The parquet\'s cell_id is unique across samples: the '
+                            'string "<sample_name>_<n>". cell_id_source holds the '
+                            'original per-sample integer n, which is what '
+                            'pair_cell_id / vol_cell_id in the sample sheets '
+                            'hold, so a crop matches its sheet row on '
+                            '(sample_name, cell_id_source).'),
             ('Read the cache',
                             'import pyarrow.parquet as pq; import torch'),
             ('',            'md = pq.read_table("concat_vqvae_cache_metadata'

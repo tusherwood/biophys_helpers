@@ -48,8 +48,13 @@ Persistence:
           approach concat_vqvae_caches.write_concat_parquet uses) so a huge
           cache stays cheap to update.
         * experiment_data.xlsx — a sickle_annotations sheet, one row per
-          transit (experiment, sample_name, cell_id, n_frames, sickle_class),
-          added/replaced without touching any other sheet.
+          transit (experiment, sample_name, cell_id, cell_id_source,
+          n_frames, sickle_class), added/replaced without touching any other
+          sheet. cell_id is the cache's sample-namespaced id; cell_id_source
+          is the per-sample integer that a sample sheet's pair_cell_id holds,
+          so join on (sample_name, cell_id_source). Caches compiled before
+          cell_id was namespaced have no cell_id_source; there cell_id is
+          already that integer.
       Only End performs this full-file rewrite; every other action just
       appends to the sidecar.
 
@@ -71,7 +76,7 @@ from tkinter import messagebox
 from PIL import Image, ImageTk
 
 import browse_pt as bpt
-from concat_vqvae_caches import _BATCH_ROWS
+from concat_vqvae_caches import _BATCH_ROWS, _CELL_ID_SOURCE
 
 _ANNOTATION_COLUMN = 'sickle_class'
 _SIDECAR_NAME       = 'sickle_annotations.jsonl'
@@ -121,18 +126,31 @@ def _parse_args() -> tuple[Path, Path, Path]:
 # ---------------------------------------------------------------------------
 
 class Transit:
-    __slots__ = ('experiment', 'sample_name', 'cell_id', 'rows')
+    __slots__ = ('experiment', 'sample_name', 'cell_id', 'rows',
+                 'cell_id_source')
 
     def __init__(self, experiment: str, sample_name: str, cell_id,
-                rows: list[int]):
+                rows: list[int], cell_id_source=None):
         self.experiment   = experiment
         self.sample_name  = sample_name
         self.cell_id      = cell_id
         self.rows         = rows   # tensor/parquet row indices, frame-ordered
+        # The per-sample integer id (the key into the sample's sheet and hdf5),
+        # when the cache namespaced cell_id to '<sample_name>_<n>'; None for
+        # caches compiled before that, whose cell_id is that integer itself.
+        self.cell_id_source = cell_id_source
 
     @property
     def key(self) -> tuple:
         return (self.experiment, self.sample_name, self.cell_id)
+
+    @property
+    def sort_key(self) -> tuple:
+        """(sample_name, per-sample id) in numeric order, so a namespaced
+        cell_id doesn't sort lexically ('s_10' before 's_2'). A missing id
+        sorts last without being compared against a real one."""
+        n = self.cell_id_source if self.cell_id_source is not None else self.cell_id
+        return (self.sample_name, n is None, n)
 
 
 def _load_transits(parquet_path: Path, n_rows: int) -> tuple[list[Transit], dict]:
@@ -163,12 +181,16 @@ def _load_transits(parquet_path: Path, n_rows: int) -> tuple[list[Transit], dict
 
     order_col = 'frame_in_cell' if 'frame_in_cell' in names else None
     has_existing = _ANNOTATION_COLUMN in names
+    has_source = _CELL_ID_SOURCE in names
     wanted = required + ([order_col] if order_col else []) \
-        + ([_ANNOTATION_COLUMN] if has_existing else [])
+        + ([_ANNOTATION_COLUMN] if has_existing else []) \
+        + ([_CELL_ID_SOURCE] if has_source else [])
     table = pf.read(columns=wanted)
     pf.close()
 
     cell_id      = table.column('cell_id').to_pylist()
+    cell_id_src  = (table.column(_CELL_ID_SOURCE).to_pylist()
+                    if has_source else None)
     experiment   = table.column('experiment').to_pylist()
     sample_name  = table.column('sample_name').to_pylist()
     order        = table.column(order_col).to_pylist() if order_col else None
@@ -186,13 +208,15 @@ def _load_transits(parquet_path: Path, n_rows: int) -> tuple[list[Transit], dict
         if order is not None:
             rows.sort(key=lambda r: (
                 order[r] if order[r] is not None else float('inf'), r))
-        transits.append(Transit(*key, rows))
+        transits.append(Transit(
+            *key, rows,
+            cell_id_source=cell_id_src[rows[0]] if cell_id_src else None))
         if existing is not None:
             val = existing[rows[0]]
             if val:
                 baseline[key] = val
 
-    transits.sort(key=lambda t: (t.sample_name, t.cell_id))
+    transits.sort(key=lambda t: t.sort_key)
     return transits, baseline
 
 
@@ -295,18 +319,23 @@ def _merge_outputs(parquet_path: Path, xlsx_path: Path,
                    transits: list[Transit], classes: dict, log=print):
     n_rows = sum(len(t.rows) for t in transits)
     col: list = [None] * n_rows
+    # cell_id_source (the per-sample id a sheet's pair_cell_id holds) is only
+    # written for caches that have one, i.e. those with a namespaced cell_id.
+    has_source = any(t.cell_id_source is not None for t in transits)
     summary_rows = []
     for t in transits:
         cls = classes.get(t.key)
         for row in t.rows:
             col[row] = cls
-        summary_rows.append({
+        summary = {
             'experiment':   t.experiment,
             'sample_name':  t.sample_name,
             'cell_id':      t.cell_id,
-            'n_frames':     len(t.rows),
-            'sickle_class': cls,
-        })
+        }
+        if has_source:
+            summary[_CELL_ID_SOURCE] = t.cell_id_source
+        summary.update({'n_frames': len(t.rows), 'sickle_class': cls})
+        summary_rows.append(summary)
 
     # --- rewrite the metadata parquet, streaming batch-by-batch ---
     pf = pq.ParquetFile(str(parquet_path))
@@ -337,7 +366,9 @@ def _merge_outputs(parquet_path: Path, xlsx_path: Path,
 
     # --- add/replace the summary sheet in the xlsx, other sheets untouched ---
     summary_df = pd.DataFrame(summary_rows, columns=[
-        'experiment', 'sample_name', 'cell_id', 'n_frames', 'sickle_class'])
+        'experiment', 'sample_name', 'cell_id',
+        *([_CELL_ID_SOURCE] if has_source else []),
+        'n_frames', 'sickle_class'])
     with pd.ExcelWriter(str(xlsx_path), engine='openpyxl', mode='a',
                         if_sheet_exists='replace') as xw:
         summary_df.to_excel(xw, sheet_name=_SHEET_NAME, index=False)
