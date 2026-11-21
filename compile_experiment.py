@@ -32,17 +32,21 @@ Gating:
              mass CSV row via analysis/density/cells' matched_peak_index,
              AND the volume_fl gate.
       VOLUME the volume_fl gate.
-      CACHE  the concatenated VQ-VAE crop cache (.pt + parquet) is gated the
-             same way, by cell: a crop (one frame) is kept iff its cell_id
-             passes the PAIRED rule above (or the VOLUME rule, for a sample
-             with no PAIRED block), evaluated on the hdf5's per-cell table.
-             Only gates remove crops — a cell the workbook omits for its
-             status_code alone keeps its crops. A sample whose cache can't be
-             gated is left out of the merge rather than merged ungated.
+      CACHE  the concatenated VQ-VAE crop cache (.pt + parquet) holds the
+             crops of exactly the cells the workbook keeps, by cell: a crop
+             (one frame) is kept iff its cell_id is in the sample's PAIRED
+             block (a successful pairing, status_code == 'ok', passing the
+             PAIRED rule above), or, for a sample whose workbook block is
+             VOLUME, a successful volume passing the VOLUME rule. So cells
+             that failed pairing or volume lose their crops, gate file or
+             not. A sample whose cache can't be filtered is left out of the
+             merge rather than merged unfiltered.
     A sample with no gate file is written ungated (has_gate = False in the
     metadata sheet). The gate bounds themselves go in the metadata sheet's
     gate_<attr>_lower / gate_<attr>_upper columns, and the per-block
-    n_<block>_ungated / n_<block>_gated counts (n_vqvae_* = crop rows).
+    n_<block>_ungated / n_<block>_gated counts (n_vqvae_* = crop rows; its
+    "gated" count is the crops kept after both the status filter and the
+    gates, which the console line breaks down).
 
 The legacy *_ProcessedVolumes.csv (imaging_fxm_results) and
 *_pairing_results/*_PairedSMRVolumes.csv sources are deprecated and no longer
@@ -318,35 +322,46 @@ def _matched_mass_keep(idx: np.ndarray, mass_keep: np.ndarray):
     return valid & mass_keep[np.where(valid, idx, 0)], valid
 
 
-def _gate_cache_rows(gates: dict, mass_df, paired: bool,
-                     cellgrouped_path: Path | None, src) -> np.ndarray:
+def _gate_cache_rows(gates: dict, mass_df, block: str | None,
+                     cellgrouped_path: Path | None, src) -> tuple[np.ndarray, int]:
     """
-    Per-row keep mask for a sample's crop cache, gating it exactly like the
-    workbook: a cache row (one frame) is kept iff its cell_id belongs to a cell
-    that passes the sample's gates, evaluated on the CELLGROUPED hdf5's
-    per-cell table the same way _apply_gates evaluates its blocks —
+    Per-row keep mask for a sample's crop cache, so its crops are those of the
+    cells the workbook keeps: a cache row (one frame) is kept iff its cell_id
+    belongs to a cell in the sample's workbook block that passes its gates,
+    evaluated on the CELLGROUPED hdf5's per-cell table the same way
+    _load_density_pairing / _load_cellgrouped_volume and _apply_gates
+    build that block —
 
-      paired (the sample has a PAIRED block): analysis/density/cells; volume_fl
-        within the volume gate AND, given mass-table gates, the cell's
-        matched_peak_index mass-CSV row passing them (unmatched cells fail).
-      otherwise (VOLUME block): analysis/volume/cells, volume gate only.
+      block 'paired' (the sample has a PAIRED block): analysis/density/cells;
+        status_code == 'ok' (a successful pairing) AND volume_fl within the
+        volume gate AND, given mass-table gates, the cell's matched_peak_index
+        mass-CSV row passing them.
+      block 'volume' (a VOLUME block): analysis/volume/cells; status_code ==
+        'ok' (a successful volume) AND the volume gate.
+      block None (no tabular block; only reached with gates): analysis/
+        volume/cells, volume gate only.
 
-    Gating is the only filter: cells the workbook omits for other reasons
-    (status_code != 'ok') keep their crops unless a gate removes them. NaN
-    values fail any gate they're tested by. `mass_df` must be the full,
-    ungated mass table. Raises ValueError if the gates can't be evaluated.
+    So a cell that failed pairing, or whose volume failed, loses its crops
+    even when the sample has no gate file (`gates` empty). NaN values fail
+    any gate they're tested by. `mass_df` must be the full, ungated mass
+    table. Returns (keep, n_status_dropped): n_status_dropped counts the rows
+    removed by the status filter alone, before any gate. Raises ValueError if
+    the mask can't be evaluated.
     """
     if cellgrouped_path is None:
         raise ValueError('no CELLGROUPED hdf5 to evaluate the gates on')
-    table = 'analysis/density/cells' if paired else 'analysis/volume/cells'
+    table = ('analysis/density/cells' if block == 'paired'
+             else 'analysis/volume/cells')
     with h5py.File(cellgrouped_path, 'r') as f:
         if table not in f:
             raise ValueError(f'{cellgrouped_path.name} has no {table} table')
         cells = f[table][:]
 
-    keep = range_mask(cells['volume_fl'], gates.get(VOLUME_GATE_KEY))
+    status_ok = (cells['status_code'] == b'ok' if block is not None
+                 else np.ones(len(cells), bool))
+    keep = status_ok & range_mask(cells['volume_fl'], gates.get(VOLUME_GATE_KEY))
     mass_gates = {k: g for k, g in gates.items() if k in MASS_GATE_KEYS}
-    if paired and mass_gates:
+    if block == 'paired' and mass_gates:
         if mass_df is None:
             raise ValueError('mass-table gates but no mass CSV to evaluate them on')
         passed, _valid = _matched_mass_keep(
@@ -355,7 +370,8 @@ def _gate_cache_rows(gates: dict, mass_df, paired: bool,
 
     cache_ids = pq.read_table(str(src.parquet_path), columns=['cell_id']) \
                   .column('cell_id').to_numpy()
-    return np.isin(cache_ids, cells['cell_id'][keep])
+    n_status_dropped = int((~np.isin(cache_ids, cells['cell_id'][status_ok])).sum())
+    return np.isin(cache_ids, cells['cell_id'][keep]), n_status_dropped
 
 
 def _apply_gates(name: str, gates: dict, mass_df, pairing_df, volume_df):
@@ -570,17 +586,24 @@ def compile_experiment(superdir: Path) -> list[dict]:
         mass_df, pairing_df, volume_df, gate_counts = _apply_gates(
             name, gates or {}, mass_df, pairing_df, volume_df)
 
-        # Gate the crop cache the same way, by cell. A cache whose gates can't
-        # be evaluated is left out rather than merged ungated.
-        if gates and vqvae_src is not None:
+        # Filter the crop cache to the cells the workbook keeps: the block's
+        # own status filter (successful pairing / volume) plus the gates, by
+        # cell. Applied whenever there is a block, gated or not. A cache whose
+        # filter can't be evaluated is left out rather than merged unfiltered.
+        cache_block = ('paired' if pairing_df is not None
+                       else 'volume' if volume_df is not None else None)
+        vqvae_drops = None
+        if vqvae_src is not None and (gates or cache_block is not None):
             try:
-                vqvae_src.row_keep = _gate_cache_rows(
-                    gates, mass_df_ungated, pairing_df is not None,
+                vqvae_src.row_keep, n_status = _gate_cache_rows(
+                    gates or {}, mass_df_ungated, cache_block,
                     paths['cellgrouped_path'], vqvae_src)
-                gate_counts['vqvae'] = (len(vqvae_src.row_keep),
-                                        int(vqvae_src.row_keep.sum()))
+                n_rows = len(vqvae_src.row_keep)
+                n_kept = int(vqvae_src.row_keep.sum())
+                gate_counts['vqvae'] = (n_rows, n_kept)
+                vqvae_drops = (n_status, n_rows - n_kept - n_status)
             except Exception as exc:
-                print(f"  [warn] {name}: could not gate the crop cache "
+                print(f"  [warn] {name}: could not filter the crop cache "
                       f"({exc}); leaving it out of the merge")
                 vqvae_src = None
 
@@ -588,7 +611,15 @@ def compile_experiment(superdir: Path) -> list[dict]:
             return 'ok' if val is not None else '--'
 
         has_volume = pairing_df is not None or volume_df is not None
-        kept = '  '.join(f"{blk} {n0}->{n1}" for blk, (n0, n1) in gate_counts.items())
+
+        def _count(blk, n0, n1):
+            text = f"{blk} {n0}->{n1}"
+            if blk == 'vqvae' and vqvae_drops is not None:
+                failed = 'unpaired' if cache_block == 'paired' else 'failed volume'
+                text += f" ({failed} -{vqvae_drops[0]}, gates -{vqvae_drops[1]})"
+            return text
+
+        kept = '  '.join(_count(blk, n0, n1) for blk, (n0, n1) in gate_counts.items())
         print(
             f"[{name}]"
             f"  mass={_tick(mass_df)}"
@@ -596,7 +627,7 @@ def compile_experiment(superdir: Path) -> list[dict]:
             f"  pairing={_tick(pairing_df)}"
             f"  gate={'--' if gates is None else ', '.join(gates) or 'none set'}"
             f"  vqvae={'ok' if vqvae_src is not None else '--'}"
-            + (f"\n    gated: {kept}" if gates else '')
+            + (f"\n    kept: {kept}" if gate_counts else '')
         )
 
         sample_records.append({
@@ -1426,13 +1457,17 @@ def _build_readme_df(timestamp: str, has_vqvae: bool = False) -> pd.DataFrame:
                             'gate_experiments_inplace.py): mass_pg, baseline_norm, '
                             'bl_slope, node_dev_mean on MASS (and on PAIRED, via '
                             'each matched cell\'s mass row), volume_fl on PAIRED '
-                            'and VOLUME. The VQ-VAE crop cache (if written) is '
-                            'gated the same way, by cell: a crop is kept iff its '
-                            'cell_id passes those gates. The bounds are in the '
+                            'and VOLUME. The VQ-VAE crop cache (if written) holds '
+                            'the crops of exactly the cells kept in the PAIRED '
+                            '(or VOLUME) block: a cell that failed pairing or '
+                            'volume, or fails a gate, has no crops in it. The '
+                            'bounds are in the '
                             'metadata sheet (gate_<attr>_lower/upper; NaN = not '
                             'gated, has_gate = False = no gate file, written '
                             'ungated), with n_<block>_ungated / n_<block>_gated '
-                            'counts (n_vqvae_* count crop rows, i.e. frames).'),
+                            'counts (n_vqvae_* count crop rows, i.e. frames, '
+                            'before / after both the pairing-or-volume status '
+                            'filter and the gates).'),
         ('Blocks are independent',
                             'Row N of one block is unrelated to row N of another; '
                             'they are separate distributions, not aligned.'),

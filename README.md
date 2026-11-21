@@ -816,16 +816,19 @@ type exist.
 every gate in the sample's gate file: the four mass-table gates (`mass_pg`,
 `baseline_norm`, `bl_slope`, `node_dev_mean`) filter the MASS block, and also the PAIRED
 block via each matched cell's mass-CSV row (`matched_peak_index`); `volume_fl` filters
-the PAIRED and VOLUME blocks. The VQ-VAE crop cache (`.pt` + parquet) is gated the same
-way, by cell: a crop (one frame) is kept only if its `cell_id` passes the same gates,
-evaluated on the CELLGROUPED hdf5's per-cell table (the PAIRED rule, or the VOLUME rule for
-a sample with no PAIRED block). Only gates remove crops — a cell the workbook drops for its
-`status_code` alone keeps its crops — so with both mass and volume gates set, the cache
-holds exactly the PAIRED block's cells. A sample whose cache can't be gated is left out of
-the merge (with a warning) rather than merged ungated. The metadata sheet records the bounds
+the PAIRED and VOLUME blocks. The VQ-VAE crop cache (`.pt` + parquet) holds the crops of
+exactly the cells the workbook keeps, by cell: a crop (one frame) is kept only if its
+`cell_id` is a cell of the sample's PAIRED block — a successful pairing (`status_code ==
+'ok'` in `analysis/density/cells`) that passes the gates — or, for a sample whose workbook
+block is VOLUME, a successful volume (`status_code == 'ok'` in `analysis/volume/cells`)
+within the volume gate. A cell that failed pairing or volume therefore has no crops, even
+in a sample with no gate file; on existing data this drops roughly 10–50% of a paired
+sample's crops. A sample whose cache can't be filtered is left out of the merge (with a
+warning) rather than merged unfiltered. The metadata sheet records the bounds
 (`gate_<attr>_lower` / `gate_<attr>_upper`, NaN where not gated), `has_gate` (False = no
 gate file, sample written ungated), and `n_<block>_ungated` / `n_<block>_gated` counts
-(`n_vqvae_*` count crop rows).
+(`n_vqvae_*` count crop rows before / after the status filter and gates; the console line
+splits the drop into its two causes).
 
 **Output** (`<superdir>/YYYYMMDD_HHMMSS_compiled/`)
 
