@@ -48,6 +48,14 @@ line, the computation runs headlessly and prints its report to stdout.
 Otherwise a small GUI form opens to collect whatever is still missing; its
 "Use per-sample reference frequency" checkbox picks the rfreq source, and in
 per-sample mode the results table gains a per-sample rfreq column.
+
+In the GUI, ticked samples can be grouped into density categories (samples
+analysed downstream at one shared media density; a built-in Skip category
+holds samples not to analyse). Rows are coloured by category and a sidebar
+lists each category's mean density and members, with a Copy button whose
+payload SMRFXMAnalysis' batch window takes via "Paste category". Categories
+are saved to <superdir>/density_categories.json on every change and restored
+when that superdir is computed again. See density_categories.py.
 """
 import argparse
 import json
@@ -55,11 +63,12 @@ import re
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import numpy as np
 import pandas as pd
 
+import density_categories
 from fsutil import is_appledouble
 
 
@@ -311,6 +320,15 @@ class BaselineDensityGUI(ttk.Frame):
     Invert Selection buttons and a live average-density readout let the user
     pick a subset of samples to average.
 
+    Ticked samples can be grouped into density categories ("Add selection to
+    category", including a built-in Skip category for samples not to
+    analyse): rows are coloured by category, and a resizable sidebar on the
+    right lists one box per category (mean, range, members, rename / delete
+    and a Copy button for SMRFXMAnalysis' batch window). See
+    density_categories.py; the categories are saved beside the CSV as
+    density_categories.json and restored when the same superdir is computed
+    again.
+
     A ttk.Frame so it can be packed into any parent widget — a throwaway
     standalone root (see run_gui()) or a page of a larger embedding GUI.
     """
@@ -320,9 +338,9 @@ class BaselineDensityGUI(ttk.Frame):
     def __init__(self, parent: tk.Widget, *, superdir: str | None,
                  calib_json: str | None, rfreq: float | None,
                  superdir_var: tk.StringVar | None = None,
-                 per_sample_rfreq: bool = False):
+                 per_sample_rfreq: bool = False,
+                 category_model: density_categories.CategoryModel | None = None):
         super().__init__(parent)
-        root = self
 
         self._superdir = superdir_var if superdir_var is not None else tk.StringVar(value=superdir or '')
         self._calib_json = tk.StringVar(value=calib_json or '')
@@ -331,7 +349,17 @@ class BaselineDensityGUI(ttk.Frame):
         self._checked: dict[str, bool] = {}
         self._densities: dict[str, float] = {}
         self._names: dict[str, str] = {}
-        self._red: set[str] = set()   # iids marked red ("done") — visual only
+        self._model = category_model if category_model is not None else density_categories.CategoryModel()
+
+        # Calculator on the left, category sidebar on the right (draggable sash).
+        self._panes = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        self._panes.pack(fill=tk.BOTH, expand=True)
+        root = ttk.Frame(self._panes)
+        self._panes.add(root, weight=4)
+        self._sidebar = density_categories.CategorySidebar(self._panes, self._model)
+        self._panes.add(self._sidebar, weight=1)
+        self._sash_placed = False
+        self._panes.bind('<Configure>', self._place_sash)
 
         pad = {'padx': 8, 'pady': 6}
         form = ttk.Frame(root)
@@ -369,11 +397,13 @@ class BaselineDensityGUI(ttk.Frame):
         ttk.Button(button_bar, text='Select All', command=self._select_all).pack(side=tk.LEFT)
         ttk.Button(button_bar, text='Select None', command=self._select_none).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(button_bar, text='Invert Selection', command=self._invert_selection).pack(side=tk.LEFT, padx=(6, 0))
-        # Visual-only row marking (doesn't affect the selection or average):
-        # red flags rows the user is done with.
-        ttk.Button(button_bar, text='Clear All Red', command=self._clear_all_red).pack(side=tk.RIGHT)
-        ttk.Button(button_bar, text='Reset Selected Color', command=self._unmark_selected).pack(side=tk.RIGHT, padx=(0, 6))
-        ttk.Button(button_bar, text='Mark Selected Red', command=self._mark_selected_red).pack(side=tk.RIGHT, padx=(0, 6))
+        # Category assignment of the ticked samples (rows are then coloured by
+        # category; see the sidebar).
+        ttk.Button(button_bar, text='Remove Selection from Category',
+                   command=self._remove_selection_from_category).pack(side=tk.RIGHT)
+        self._add_button = ttk.Button(button_bar, text='Add Selection to Category ▾',
+                                      command=self._show_category_menu)
+        self._add_button.pack(side=tk.RIGHT, padx=(0, 6))
 
         table_frame = ttk.Frame(root)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(6, 0))
@@ -394,7 +424,7 @@ class BaselineDensityGUI(ttk.Frame):
         # on Treeview's tag-priority rules.
         self._tree.tag_configure('even', background='#ffffff')
         self._tree.tag_configure('odd', background='#ececec')
-        self._tree.tag_configure('done', background='#f4a3a3')
+        # plus one 'cat_<id>' tag per category, configured in _recolor_rows
 
         vsb = ttk.Scrollbar(table_frame, orient='vertical', command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
@@ -419,6 +449,14 @@ class BaselineDensityGUI(ttk.Frame):
 
         self._range_label = ttk.Label(root, text='Min: n/a    Max: n/a')
         self._range_label.pack(anchor='w', padx=8, pady=(0, 8))
+
+        self._model.add_listener(self._recolor_rows)
+
+    def _place_sash(self, event):
+        # Sidebar starts at ~22% of the width; after that the user owns the sash.
+        if not self._sash_placed and event.width > 100:
+            self._sash_placed = True
+            self._panes.sashpos(0, int(event.width * 0.78))
 
     def _pick_superdir(self):
         chosen = filedialog.askdirectory(title='Select experiment superdir',
@@ -449,8 +487,8 @@ class BaselineDensityGUI(ttk.Frame):
         self._checked.clear()
         self._densities.clear()
         self._names.clear()
-        self._red.clear()
         self._show_rfreq_column(per_sample)
+        infos = []
 
         for i, (name, n, mean_b, _source, rfreq, _rsrc) in enumerate(rows):
             iid = str(i)
@@ -466,35 +504,82 @@ class BaselineDensityGUI(ttk.Frame):
                 f'{rfreq:.10g}' if np.isfinite(rfreq) else 'no JSON',
                 f'{density:.6g}' if has_density else 'n/a',
             ))
-            self._apply_row_color(iid)
+            infos.append(density_categories.SampleInfo(name, int(n), float(density), float(rfreq)))
 
+        # Restores saved categories for a new superdir; recolours via the listener.
+        self._model.set_samples(Path(self._superdir.get().strip()), infos)
         self._update_average()
 
-    # -- row coloring (visual only) --------------------------------------
+    # -- categories / row colouring -------------------------------------------
 
-    def _apply_row_color(self, iid: str):
-        if iid in self._red:
-            tag = 'done'
+    def _recolor_rows(self):
+        if not self.winfo_exists():
+            return
+        for cat in self._model.categories:
+            self._tree.tag_configure(f'cat_{cat.id}', background=cat.color)
+        for iid, name in self._names.items():
+            cat = self._model.category_of(name)
+            if cat is not None:
+                tag = f'cat_{cat.id}'
+            else:
+                tag = 'odd' if self._tree.index(iid) % 2 else 'even'
+            self._tree.item(iid, tags=(tag,))
+
+    def _checked_names(self) -> list[str]:
+        return [self._names[iid] for iid, checked in self._checked.items() if checked]
+
+    def _show_category_menu(self):
+        menu = tk.Menu(self, tearoff=False)
+        menu.add_command(label='New category…', command=lambda: self._assign_selection(None))
+        user_cats = [c for c in self._model.ordered_categories() if not c.skip]
+        if user_cats:
+            menu.add_separator()
+            for cat in user_cats:
+                menu.add_command(label=cat.name, background=cat.color,
+                                 command=lambda cid=cat.id: self._assign_selection(cid))
+        menu.add_separator()
+        menu.add_command(label=density_categories.SKIP_NAME,
+                         background=density_categories.SKIP_COLOR,
+                         command=lambda: self._assign_selection(density_categories.SKIP_ID))
+        button = self._add_button
+        try:
+            menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _assign_selection(self, cat_id: str | None):
+        """Put the ticked samples in category `cat_id` (None: a new one)."""
+        names = self._checked_names()
+        if not names:
+            messagebox.showinfo('Categories', 'Tick the samples to add first.', parent=self)
+            return
+        moving = [n for n in names
+                  if (c := self._model.category_of(n)) is not None and c.id != cat_id]
+        if moving:
+            listed = '\n'.join(f'  {n}  ({self._model.category_of(n).name})' for n in moving[:15])
+            more = f'\n  … and {len(moving) - 15} more' if len(moving) > 15 else ''
+            if not messagebox.askyesno(
+                    'Categories', f'{len(moving)} ticked sample(s) are already in another category '
+                                  f'and will be moved:\n{listed}{more}\n\nContinue?', parent=self):
+                return
+        if cat_id is None:
+            name = simpledialog.askstring('New category', 'Name for the new category:',
+                                          initialvalue=self._model.default_name(), parent=self)
+            if name is None:
+                return
+            self._model.new_category(name, names)
         else:
-            tag = 'odd' if self._tree.index(iid) % 2 else 'even'
-        self._tree.item(iid, tags=(tag,))
+            self._model.assign(names, cat_id)
+        self._select_none()
 
-    def _mark_selected_red(self):
-        for iid, checked in self._checked.items():
-            if checked:
-                self._red.add(iid)
-                self._apply_row_color(iid)
-
-    def _unmark_selected(self):
-        for iid, checked in self._checked.items():
-            if checked:
-                self._red.discard(iid)
-                self._apply_row_color(iid)
-
-    def _clear_all_red(self):
-        red, self._red = self._red, set()
-        for iid in red:
-            self._apply_row_color(iid)
+    def _remove_selection_from_category(self):
+        names = [n for n in self._checked_names() if self._model.category_of(n) is not None]
+        if not names:
+            messagebox.showinfo('Categories', 'None of the ticked samples is in a category.',
+                                parent=self)
+            return
+        self._model.unassign(names)
+        self._select_none()
 
     def _on_tree_click(self, event):
         # Clicking anywhere on a row toggles its checkbox.
@@ -598,6 +683,8 @@ class BaselineDensityGUI(ttk.Frame):
             self._tree.delete(*self._tree.get_children())
             self._checked.clear()
             self._densities.clear()
+            self._names.clear()
+            self._model.set_samples(superdir, [])
             self._update_average()
             return
 
@@ -613,7 +700,7 @@ def run_gui(*, superdir: str | None, calib_json: str | None, rfreq: float | None
             per_sample_rfreq: bool = False):
     root = tk.Tk()
     root.title('Baseline Density Calculator')
-    root.minsize(640, 480)
+    root.minsize(900, 520)
     gui = BaselineDensityGUI(root, superdir=superdir, calib_json=calib_json, rfreq=rfreq,
                              per_sample_rfreq=per_sample_rfreq)
     gui.pack(fill=tk.BOTH, expand=True)
@@ -628,7 +715,9 @@ def build_embedded_page(parent: tk.Widget, *, superdir: str | None = None,
                         calib_json: str | None = None,
                         rfreq: float | None = None,
                         superdir_var: tk.StringVar | None = None,
-                        per_sample_rfreq: bool = False) -> ttk.Frame:
+                        per_sample_rfreq: bool = False,
+                        category_model: density_categories.CategoryModel | None = None,
+                        ) -> ttk.Frame:
     """
     Build this tool's GUI as a Frame suitable for embedding in a larger
     application (e.g. a wizard page), rather than owning its own Tk root.
@@ -637,10 +726,14 @@ def build_embedded_page(parent: tk.Widget, *, superdir: str | None = None,
     page's directory field to a StringVar shared with another page — e.g. a
     wizard sharing one directory across several steps. `per_sample_rfreq`
     sets the initial state of the per-sample reference-frequency checkbox.
+    Pass a `category_model` to share the density categories with other
+    pages (the wizard's category review step); otherwise the page keeps its
+    own.
     """
     return BaselineDensityGUI(parent, superdir=superdir, calib_json=calib_json,
                               rfreq=rfreq, superdir_var=superdir_var,
-                              per_sample_rfreq=per_sample_rfreq)
+                              per_sample_rfreq=per_sample_rfreq,
+                              category_model=category_model)
 
 
 # ---------------------------------------------------------------------------

@@ -112,28 +112,53 @@ them. Each of those scripts still works standalone from the CLI exactly as
 documented below — the wizard just calls a `build_embedded_page(...)`
 function each one exposes for this purpose.
 
-Pages, sharing one experiment-directory field across pages 2-3 (typing in
-either updates the other live; page 4 seeds from it once):
+Pages, sharing one experiment-directory field across pages 2 and 4 (typing in
+either updates the other live; page 5 seeds from it once):
 1. Buoyant mass — placeholder: run the MATLAB SMR analysis separately first.
-2. Baseline density — placeholder text + `calculate_baseline_density.py`'s
-   GUI. A valid directory must be set here before Next becomes available.
-3. Gating: Buoyant Mass + Volume — `gate_experiments_inplace.py` in combined
+2. Baseline density & categories — `calculate_baseline_density.py`'s GUI
+   with its **density categories** (see that section): group the samples
+   to be imaging-analysed at one shared media density, with **Skip** for
+   samples not to analyse. Next needs the calculation run for the current
+   directory and every sample in a category.
+3. Imaging analysis by category — one card per category (samples, their
+   densities and reference frequencies, the mean, on-disk analysis status)
+   with a **Copy for batch window** button. SMRFXMAnalysis' Bulk Run Queue
+   window opens automatically the first time this page is shown (directly,
+   already scanned on the experiment directory, in the `paella_analysis`
+   env; **Open batch analysis window** reopens it). In that window,
+   **Paste category** ticks exactly the category's samples and locks the
+   media density to its mean (with an override). Status is read from the
+   samples' HDF5s on showing the page, every 30 s, and on **Refresh status**:
+   a category is *Analysed* once every sample's newest
+   `*_imaging_fxm_results` run has finished volume and density analysis at
+   that category's density (4 decimals; BF-only systems need only the image
+   stage, samples with no image binaries have nothing to analyse), *Needs
+   rerun* when a sample ran at a different density. Next needs every
+   category analysed; a sample that can't be analysed can be moved to Skip
+   in step 2.
+4. Gating: Buoyant Mass + Volume — `gate_experiments_inplace.py` in combined
    mode: mass, normalized baseline, baseline slope, average node deviation
    and iFXM volume, all gated per-sample together (see below). Whichever of
    mass/volume data is present gets gated. Auto-discovers as soon as the
    directory is set — no Discover click needed.
-4. Compile experiment — `compile_experiment.py`'s GUI, directory pre-filled
-   from pages 2-3 but (unlike page 3) still requiring an explicit
-   "Discover Samples" click. Clicking its Done button advances to page 5.
-5. New analysis dir — `new_analysis_dir.py`'s GUI, using the shared
+5. Compile experiment — `compile_experiment.py`'s GUI, directory pre-filled
+   from pages 2 and 4 but (unlike page 4) still requiring an explicit
+   "Discover Samples" click. Clicking its Done button advances to page 6.
+6. New analysis dir — `new_analysis_dir.py`'s GUI, using the shared
    directory as its raw data dir (no list picker): **Create** scaffolds the
    code and data_analysis dirs named after it, then offers to copy in its
    `*_compiled` and `*_gating_summary` dirs. Its Close button closes the
    wizard.
 
-Page 3 requires clicking its embedded panel's **Finalize gating** button
+Page 4 requires clicking its embedded panel's **Finalize gating** button
 before Next becomes available (re-running discovery there revokes this
 until Finalize is clicked again).
+
+The batch window is found at the `paella_analysis` conda env beside this one
+and an `SMRFXMAnalysis` checkout beside this repo (whatever branch it has
+checked out); set the `SMRFXM_PYTHON` (its `python.exe`) and `SMRFXM_REPO`
+environment variables to override either. If it exits during startup, the
+wizard shows the tail of `%TEMP%\analysis_wizard_batch_window.log`.
 
 ```bash
 python analysis_wizard.py
@@ -486,6 +511,19 @@ step 2, where it starts ticked), a **Use per-sample reference frequency** checkb
 ticked, the single-value field is disabled, the results table gains a per-sample
 *Ref. frequency* column, and samples with no JSON are unchecked and left out of
 the average.
+
+**Density categories (GUI).** Tick samples and use **Add Selection to Category ▾**
+(a new category, an existing one, or **Skip (don't analyse)**) to group samples
+that will be imaging-analysed at one shared media density; **Remove Selection
+from Category** takes them back out. A sample is in at most one category
+(moving one asks first), and a category left empty disappears. Rows are coloured
+by category, and a resizable sidebar on the right has one box per category: mean
+baseline density (over members with a density), n, min/max, an expandable sample
+list, rename (✎), delete (🗑) and **Copy**, which puts the category on the
+clipboard for SMRFXMAnalysis' Bulk Run Queue (**Paste category** there). The
+categories are saved to `<superdir>/density_categories.json` on every change
+(name, colour, samples, mean) and restored when that superdir is computed again.
+This replaces the old *Mark Selected Red* row marking.
 
 **Output** (written inside `<superdir>`, at the same level as the sample subdirs)
 
