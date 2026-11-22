@@ -2,9 +2,12 @@
 compile_experiment.py
 
 Automatically discovers and compiles all per-sample data for an experiment
-into a pair of HDF5 files. Given a superdir, it walks each sample subdir,
-finds every known data type (BM mass, iFXM volume, pairing, gating, images),
-loads them, and writes a structured output.
+into an Excel workbook (experiment_data.xlsx) plus a concatenated VQ-VAE crop
+cache. Given a superdir, it walks each sample subdir, finds every known data
+type (BM mass, iFXM volume, pairing, gating, crops), loads them, and writes a
+structured output. Before writing, a spreadsheet-style GUI annotates the
+samples (custom meta_ columns, optionally auto-detected from the sample names
+— see sample_name_parser.py) and, with --coulter, associates Coulter columns.
 
 Recognised sub-subdir types (all optional; most-recent used if multiple exist):
     *_mass_results          — mass CSV with mass_pg column
@@ -686,10 +689,18 @@ class CompileAnnotationWindow(ttk.Frame):
     this script) should bind WM_DELETE_WINDOW on its own root to this
     instance's handle_close() method, which calls on_result(False, {}, {},
     [], set(), <original sample order>) — see main().
+
+    "Auto-detect from names…" opens auto_metadata_dialog.AutoMetadataDialog,
+    which proposes columns parsed from the sample names (sample_name_parser);
+    its Apply adds/fills them here as one undoable step. `column_sources`
+    ({column: parser rule}) records which columns came from it, for the
+    workbook's README sheet. `auto_detect_on_open` opens that dialog as soon
+    as the table appears (the analysis wizard does).
     """
 
     def __init__(self, parent: tk.Widget, sample_names: list,
-                 volume_names, coulter_cols: list, on_result=None):
+                 volume_names, coulter_cols: list, on_result=None,
+                 auto_detect_on_open: bool = False):
         super().__init__(parent)
         self._on_result = on_result
         self._samples = list(sample_names)
@@ -702,10 +713,13 @@ class CompileAnnotationWindow(ttk.Frame):
         self._active_editor = None
         self._vlines: list = []
         self._last_col = None
+        self.column_sources: dict = {}
 
         # Undo history: each entry is a list of (sample, col, old_value) tuples
         # describing the cells a single action changed, so one action (a cell
-        # edit or a bulk Set Cells) is undone atomically.
+        # edit or a bulk Set Cells) is undone atomically — or, for an
+        # auto-detect Apply, a dict {'cells': [...], 'added_cols': [...]} whose
+        # undo also removes the columns it added.
         self._undo_stack: list = []
 
         # Per-sample cell values; the Coulter assignment lives here too, under
@@ -716,6 +730,8 @@ class CompileAnnotationWindow(ttk.Frame):
                      else 'Annotate samples')
         self._build_ui()
         self._populate_table()
+        if auto_detect_on_open:
+            self.after_idle(self._auto_detect)
 
     # ------------------------------------------------------------------
     # Column lists
@@ -783,6 +799,8 @@ class CompileAnnotationWindow(ttk.Frame):
         btn_frame = tk.Frame(self)
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 8))
 
+        tk.Button(btn_frame, text="Auto-detect from names…",
+                  command=self._auto_detect).pack(side=tk.LEFT, padx=(0, 12))
         tk.Button(btn_frame, text="Add Column",
                   command=self._add_column).pack(side=tk.LEFT, padx=(0, 4))
         tk.Button(btn_frame, text="Remove Column",
@@ -1090,14 +1108,91 @@ class CompileAnnotationWindow(ttk.Frame):
 
         if not self._undo_stack:
             return
-        changes = self._undo_stack.pop()
-        for sample, col, old_value in changes:
-            self._row_data[sample][col] = old_value
-            self._refresh_row(sample)
+        entry = self._undo_stack.pop()
+        if isinstance(entry, dict):          # an auto-detect Apply
+            for sample, col, old_value in entry['cells']:
+                self._row_data[sample][col] = old_value
+            for col in entry['added_cols']:
+                self._custom_cols.remove(col)
+                self._checkbox_cols.discard(col)
+                self.column_sources.pop(col, None)
+                for rd in self._row_data.values():
+                    rd.pop(col, None)
+            for col, source in entry.get('old_sources', {}).items():
+                if source is None:
+                    self.column_sources.pop(col, None)
+                else:
+                    self.column_sources[col] = source
+            self._rebuild_table()
+        else:
+            for sample, col, old_value in entry:
+                self._row_data[sample][col] = old_value
+                self._refresh_row(sample)
 
         if not self._undo_stack:
             self._undo_btn.config(state=tk.DISABLED)
         self._check_done()
+
+    # ------------------------------------------------------------------
+    # Auto-detect from sample names
+    # ------------------------------------------------------------------
+
+    def _auto_detect(self):
+        import auto_metadata_dialog
+        existing = {c: ('checkbox' if c in self._checkbox_cols else 'text')
+                    for c in self._custom_cols}
+        auto_metadata_dialog.AutoMetadataDialog(
+            self, self._samples, existing_columns=existing,
+            on_apply=self._apply_auto_columns)
+
+    def _apply_auto_columns(self, columns: list, overwrite: bool):
+        """
+        Add/fill the dialog's columns: a new name becomes a column; an
+        existing one only has its empty cells filled (all cells with
+        `overwrite`). Recorded as a single undo step that also removes the
+        columns it added.
+        """
+        added, cells, old_sources = [], [], {}
+        for col in columns:
+            name = col['name']
+            if name not in self._custom_cols:
+                self._custom_cols.append(name)
+                if col['kind'] == 'checkbox':
+                    self._checkbox_cols.add(name)
+                for rd in self._row_data.values():
+                    rd[name] = ''
+                added.append(name)
+            is_checkbox = name in self._checkbox_cols
+            for sample, value in col['values'].items():
+                if sample not in self._row_data:
+                    continue
+                if is_checkbox:
+                    value = 'yes' if value == 'yes' else ''
+                old = self._row_data[sample].get(name, '')
+                if value == old or (value == '' and not is_checkbox):
+                    continue
+                if old != '' and not overwrite:
+                    continue
+                cells.append((sample, name, old))
+                self._row_data[sample][name] = value
+            old_sources[name] = self.column_sources.get(name)
+            self.column_sources[name] = col.get('source', 'sample name')
+
+        if added or cells:
+            self._push_undo({'cells': cells, 'added_cols': added,
+                             'old_sources': old_sources})
+        self._rebuild_table()
+
+    def _rebuild_table(self):
+        """Re-lay out the columns and rows, keeping the user's row order."""
+        order = list(self._tree.get_children())
+        self._setup_columns()
+        self._populate_table()
+        for i, item in enumerate(order):
+            if self._tree.exists(item):
+                self._tree.move(item, '', i)
+        self._restripe()
+        self._tree.after_idle(self._draw_gridlines)
 
     # ------------------------------------------------------------------
     # Button actions
@@ -1203,6 +1298,7 @@ class CompileAnnotationWindow(ttk.Frame):
             return
         self._custom_cols.remove(name)
         self._checkbox_cols.discard(name)
+        self.column_sources.pop(name, None)
         for rd in self._row_data.values():
             rd.pop(name, None)
         self._clear_undo()
@@ -1568,7 +1664,10 @@ def _write_output(superdir: Path, sample_records: list,
                   custom_cols: list | None = None,
                   checkbox_cols: set | None = None,
                   ordered_samples: list | None = None,
-                  save_vqvae: bool = True) -> Path:
+                  save_vqvae: bool = True,
+                  column_sources: dict | None = None) -> Path:
+    """`column_sources`: {annotation column: sample-name parser rule} for
+    the columns auto-detected from sample names, listed in the README."""
     pairing       = pairing       or {}
     annotations   = annotations   or {}
     custom_cols   = custom_cols   or []
@@ -1634,6 +1733,17 @@ def _write_output(superdir: Path, sample_records: list,
         meta_rows.append(entry)
 
     meta_df = pd.DataFrame(meta_rows)
+    # A text annotation column whose every non-empty value is a number is
+    # written as numbers (blanks -> empty cells), so time_h / dose_uM / ...
+    # reach downstream tools numeric rather than as text.
+    for col in custom_cols:
+        key = f'meta_{col}'
+        if col in checkbox_cols or key not in meta_df.columns:
+            continue
+        vals = meta_df[key].astype(str).str.strip()
+        filled = vals[vals != '']
+        if len(filled) and pd.to_numeric(filled, errors='coerce').notna().all():
+            meta_df[key] = pd.to_numeric(vals.where(vals != '', None), errors='coerce')
 
     _EXCEL_MAX_ROWS = 1_048_576   # incl. the header row
 
@@ -1673,6 +1783,13 @@ def _write_output(superdir: Path, sample_records: list,
                 startcol += len(blk.columns) + 1   # +1 blank spacer column
 
         readme_df = _build_readme_df(timestamp, vqvae_plan is not None)
+        sources = {c: s for c, s in (column_sources or {}).items() if c in custom_cols}
+        if sources:
+            readme_df = pd.concat([readme_df, pd.DataFrame(
+                [('Auto-detected columns',
+                  'Parsed from the sample names (then editable in the GUI): '
+                  + '; '.join(f'meta_{c} <- {s}' for c, s in sources.items()))],
+                columns=readme_df.columns)], ignore_index=True)
         readme_df.to_excel(xw, sheet_name='README', index=False)
 
     print(f"\nCompiled {len(sample_records)} sample(s) -> {xlsx_path}")
@@ -1730,7 +1847,7 @@ def main():
 
         _write_output(superdir, records, pairing,
                       annotations, custom_cols, checkbox_cols, ordered_samples,
-                      save_vqvae)
+                      save_vqvae, column_sources=aw.column_sources)
         ann_root.destroy()
 
     ann_root = tk.Tk()
@@ -1750,7 +1867,8 @@ def main():
 
 def build_embedded_page(parent: tk.Widget, *,
                         initial_superdir: str | None = None,
-                        on_done=None) -> ttk.Frame:
+                        on_done=None,
+                        auto_detect_names: bool = False) -> ttk.Frame:
     """
     Build this tool's discover-and-compile UI as a Frame suitable for
     embedding in a larger application, e.g. a wizard page.
@@ -1765,6 +1883,9 @@ def build_embedded_page(parent: tk.Widget, *,
     `on_done`, if given, is called after a successful compile (i.e. after
     the embedded window's Done button is clicked) — e.g. a wizard hosting
     this as its final page can pass its own root.destroy to close on Done.
+
+    `auto_detect_names` opens the "Auto-detect from names" dialog each time
+    Discover Samples builds a fresh annotation table.
     """
     page = ttk.Frame(parent)
 
@@ -1860,7 +1981,8 @@ def build_embedded_page(parent: tk.Widget, *,
 
             out_dir = _write_output(superdir, records, pairing,
                                     annotations, custom_cols, checkbox_cols,
-                                    ordered_samples, save_vqvae)
+                                    ordered_samples, save_vqvae,
+                                    column_sources=aw.column_sources)
             _set_status(f'Compiled -> {out_dir}', kind='done')
             if on_done is not None:
                 on_done()
@@ -1868,7 +1990,8 @@ def build_embedded_page(parent: tk.Widget, *,
         volume_names = {r['name'] for r in records if r['has_volume']}
         aw = CompileAnnotationWindow(
             panel_container, [r['name'] for r in records], volume_names,
-            coulter_cols, on_result=on_result)
+            coulter_cols, on_result=on_result,
+            auto_detect_on_open=auto_detect_names)
         aw.pack(fill=tk.BOTH, expand=True)
 
     ttk.Button(top, text='Discover Samples', command=_discover).grid(

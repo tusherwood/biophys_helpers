@@ -33,8 +33,10 @@ existing per-stage GUIs rather than reimplementing them:
                              field is seeded from the shared directory the
                              first time this page is built, but (unlike
                              step 4) still requires an explicit "Discover
-                             Samples" click. Clicking its Done button
-                             advances to step 6.
+                             Samples" click, which also opens "Auto-detect
+                             from names" (metadata parsed from the sample
+                             names, reviewed before it fills the table).
+                             Clicking its Done button advances to step 6.
     6. New analysis dir   — new_analysis_dir.py embedded, using the shared
                              directory as its raw data dir: Create scaffolds
                              the code + data_analysis dirs named after it,
@@ -388,7 +390,7 @@ def main():
     def build_compile(parent):
         return compile_experiment.build_embedded_page(
             parent, initial_superdir=experiment_superdir.get(),
-            on_done=wiz.go_next)
+            on_done=wiz.go_next, auto_detect_names=True)
 
     def build_new_analysis_dir(parent):
         page = ttk.Frame(parent)
