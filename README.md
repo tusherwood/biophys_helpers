@@ -70,6 +70,7 @@ python -m unittest discover -s tests
 **Per-user settings** (not in the repo):
 - `~/.biophys_helpers/sample_name_rules.json` — the sample-name parsing rules used by
   `compile_experiment.py`'s *Auto-detect from names* (created when you first save a rule).
+- `~/.biophys_helpers/wizard_state.json` — the analysis wizard's last experiment directory.
 - `SMRFXM_PYTHON` / `SMRFXM_REPO` environment variables — where the analysis wizard finds
   the `paella_analysis` Python and the SMRFXMAnalysis checkout (defaults: the
   `paella_analysis` conda env beside this one, and `../SMRFXMAnalysis`).
@@ -130,56 +131,72 @@ from SMRFXMAnalysis' `*_CELLGROUPED.hdf5` (see [Deprecated](#deprecated)).
 
 ### `analysis_wizard.py`  · _GUI_
 
-One-stop-shop wizard that walks the buoyant-mass → baseline-density →
-gating → compile portion of the workflow above as a sequence of "step"
-pages with Previous/Next navigation, embedding the existing GUIs for
+One-stop-shop wizard that walks one experiment through the pipeline above as a
+sequence of step pages, embedding the existing GUIs for
 `calculate_baseline_density.py`, `gate_experiments_inplace.py` (combined
-mass + volume mode), `compile_experiment.py` and `new_analysis_dir.py` rather than reimplementing
-them. Each of those scripts still works standalone from the CLI exactly as
-documented below — the wizard just calls a `build_embedded_page(...)`
-function each one exposes for this purpose.
+mass + volume mode), `compile_experiment.py` and `new_analysis_dir.py` rather than
+reimplementing them. Each of those scripts still works standalone exactly as
+documented below — the wizard just calls a `build_embedded_page(...)` function each
+one exposes for this purpose.
 
-Pages, sharing one experiment-directory field across pages 2 and 4 (typing in
-either updates the other live; page 5 seeds from it once):
-1. Buoyant mass — placeholder: run the MATLAB SMR analysis separately first.
-2. Baseline density & categories — `calculate_baseline_density.py`'s GUI
-   with its **density categories** (see that section): group the samples
-   to be imaging-analysed at one shared media density, with **Skip** for
-   samples not to analyse. Next needs the calculation run for the current
-   directory and every sample in a category.
-3. Imaging analysis by category — one card per category (samples, their
-   densities and reference frequencies, the mean, on-disk analysis status)
-   with a **Copy for batch window** button. SMRFXMAnalysis' Bulk Run Queue
-   window opens automatically the first time this page is shown (directly,
-   already scanned on the experiment directory, in the `paella_analysis`
-   env; **Open batch analysis window** reopens it). In that window,
-   **Paste category** ticks exactly the category's samples and locks the
-   media density to its mean (with an override). Status is read from the
-   samples' HDF5s on showing the page, every 30 s, and on **Refresh status**:
-   a category is *Analysed* once every sample's newest
-   `*_imaging_fxm_results` run has finished volume and density analysis at
-   that category's density (4 decimals; BF-only systems need only the image
-   stage, samples with no image binaries have nothing to analyse), *Needs
-   rerun* when a sample ran at a different density. Next needs every
-   category analysed; a sample that can't be analysed can be moved to Skip
-   in step 2.
-4. Gating: Buoyant Mass + Volume — `gate_experiments_inplace.py` in combined
-   mode: mass, normalized baseline, baseline slope, average node deviation
-   and iFXM volume, all gated per-sample together (see below). Whichever of
-   mass/volume data is present gets gated. Auto-discovers as soon as the
-   directory is set — no Discover click needed.
-5. Compile experiment — `compile_experiment.py`'s GUI, directory pre-filled
-   from pages 2 and 4 but (unlike page 4) still requiring an explicit
-   "Discover Samples" click. Clicking its Done button advances to page 6.
-6. New analysis dir — `new_analysis_dir.py`'s GUI, using the shared
-   directory as its raw data dir (no list picker): **Create** scaffolds the
-   code and data_analysis dirs named after it, then offers to copy in its
-   `*_compiled` and `*_gating_summary` dirs. Its Close button closes the
-   wizard.
+A **step sidebar** on the left lists every step with its status read from disk
+(✓ done, ◐ partial, ! stale, ○ not started) and jumps to any step on click;
+**Previous / Next** walk them in order. The experiment directory is shared by every
+page (typing in one updates the others live) and remembered between sessions in
+`~/.biophys_helpers/wizard_state.json`.
 
-Page 4 requires clicking its embedded panel's **Finalize gating** button
-before Next becomes available (re-running discovery there revokes this
-until Finalize is clicked again).
+1. **Overview** — the experiment directory (starts at the last one used; type, paste
+   or **Browse** to change it) and a checklist of where the experiment is, read from
+   disk by [`experiment_status.py`](experiment_status.py): buoyant mass (the MATLAB
+   SMR analysis, run outside the wizard), baseline density & categories, imaging per
+   category, gating, compile (flagged *stale* when gate files, the samples' newest
+   imaging HDF5s or the saved annotations changed after it), and the new analysis
+   dir, each with an **Open** button. **Continue where I left off** jumps to the
+   first unfinished step after the furthest finished one.
+2. **Baseline density & categories** — `calculate_baseline_density.py`'s GUI with
+   its **density categories** (see that section): group the samples to be
+   imaging-analysed at one shared media density, with **Skip** for samples not to
+   analyse. A directory's last saved result (`*_baseline_density.csv`) and its
+   categories are shown straight away, without re-running. Next needs every sample
+   in a category.
+3. **Imaging analysis by category** — one card per category (samples, their
+   densities and reference frequencies, the mean, on-disk analysis status) with a
+   **Copy for batch window** button. SMRFXMAnalysis' Bulk Run Queue window opens
+   automatically the first time this page is shown (directly, already scanned on the
+   experiment directory, in the `paella_analysis` env; **Open batch analysis
+   window** reopens it). In that window, **Paste category** ticks exactly the
+   category's samples and locks the media density to its mean (with an override).
+   Status is read from the samples' HDF5s on showing the page, every 30 s, and on
+   **Refresh status**: a category is *Analysed* once every sample's newest
+   `*_imaging_fxm_results` run has finished volume and density analysis at that
+   category's density (4 decimals; BF-only systems need only the image stage,
+   samples with no image binaries have nothing to analyse), *Needs rerun* when a
+   sample ran at a different density. Next needs every category analysed; a sample
+   that can't be analysed can be moved to Skip in step 2.
+4. **Gating: Buoyant Mass + Volume** — `gate_experiments_inplace.py` in combined
+   mode: mass, normalized baseline, baseline slope, average node deviation and iFXM
+   volume, all gated per-sample together (see below). Auto-discovers as soon as the
+   directory is set. Next needs **Finalize gating** — or every sample already having
+   a gate file on disk, which Next then keeps as they are.
+5. **Sample QC** — [`sample_qc.py`](sample_qc.py): one row per sample with its
+   category and baseline density, mass cells (before / after gates), paired cells
+   as a share of the mass cells and of the imaged cells, cells and crops kept after
+   gating, whether it has a gate file, and its imaging status. Rows are flagged
+   (highlighted) for: no gate file; paired share of mass cells under 20% or under
+   half the experiment median; gates keeping under half the median fraction; under
+   100 cells kept; imaging pending or run at a different density than its category.
+   Click a header to sort. Loads in the background; the loaded samples are reused
+   by step 6 as long as nothing it reads changed on disk. Nothing here blocks Next.
+6. **Compile experiment** — `compile_experiment.py`'s GUI, directory pre-filled but
+   still requiring an explicit **Discover Samples** click. The annotation table is
+   saved as you edit (`<experiment>/compile_annotations.json`) and restored on the
+   next Discover, so re-compiling after re-gating doesn't mean re-annotating; with
+   no saved file it is seeded from the previous compile's metadata sheet. A table
+   that starts empty opens **Auto-detect from names**. Clicking Done advances.
+7. **New analysis dir** — `new_analysis_dir.py`'s GUI, using the shared directory as
+   its raw data dir (no list picker): **Create** scaffolds the code and
+   data_analysis dirs named after it, then offers to copy in its `*_compiled` and
+   `*_gating_summary` dirs. Its Close button closes the wizard.
 
 The batch window is found at the `paella_analysis` conda env beside this one
 and an `SMRFXMAnalysis` checkout beside this repo (whatever branch it has
@@ -836,6 +853,8 @@ concat_vqvae_cache_metadata.parquet  gated and concatenated along axis 0 (see be
 > The `buoyant_density` column is **relative**. Add the per-sample offset from
 > `calculate_baseline_density.py` to get absolute density in g/mL.
 
+**Annotations are saved.** The annotation table is written to `<superdir>/compile_annotations.json` on every change (cells, Set Cells, columns, auto-detect, Undo, row order) and restored the next time the experiment is discovered — samples no longer present are dropped, new ones start blank. With no saved file, the newest `*_compiled/experiment_data.xlsx` seeds it from its metadata sheet's `meta_` columns (a yes/no-only column becomes a checkbox) and `coulter_column`.
+
 **Annotation columns, auto-detected from sample names**
 
 The annotation GUI's **Auto-detect from names…** button (opened automatically in the
@@ -1370,6 +1389,8 @@ These are imported by the scripts above and are not run directly.
 | [`gating/common.py`](gating/common.py) | Shared GUI components and output utilities for the gating tools: `CutoffWindow` (click-to-set histogram with X-axis view control), `MainWindow` (scrollable sample list), `ask_data_type_dialog`, `save_group_histograms`, `write_stats_csv`, `write_log`. Used by `gate_bm_coulter.py` and `gate_experiments_inplace.py`. |
 | [`gating/gates.py`](gating/gates.py) | The per-sample gate file format (`<sample>/<timestamp>_gating/<sample>_gate.yaml`) and the GUI-free gate math shared by its writer (`gate_experiments_inplace.py`) and readers (`compile_experiment.py`, `pair_bm_runs.py`). |
 | [`density_categories.py`](density_categories.py) | Density categories for `calculate_baseline_density.py` and the analysis wizard: the category model (saved as `<superdir>/density_categories.json`), the category sidebar and review page, the clipboard payload SMRFXMAnalysis' batch window takes via *Paste category*, the on-disk analysis-status check (h5py), and the launcher for that batch window. |
+| [`experiment_status.py`](experiment_status.py) | Where an experiment is in the pipeline, read from disk (mass, baseline & categories, imaging per category, gating, compile incl. staleness, new analysis dir) — the analysis wizard's Overview and step sidebar. |
+| [`sample_qc.py`](sample_qc.py) | The wizard's per-sample QC table and flags, and `RecordsCache`, which keeps `compile_experiment()`'s loaded samples while nothing on disk changes. |
 | [`sample_name_parser.py`](sample_name_parser.py) | GUI-free parser that proposes per-sample metadata from sample directory names (time, drug/dose, osmolarity, flags, word lists, replicate), with the user rules file `~/.biophys_helpers/sample_name_rules.json`. |
 | [`auto_metadata_dialog.py`](auto_metadata_dialog.py) | `compile_experiment.py`'s *Auto-detect from names* review dialog (and its rules editor), built on `sample_name_parser.py`. |
 | [`pipeline/stage2/pairing_utils.py`](pipeline/stage2/pairing_utils.py) | Cross-correlation pairing primitives (SciPy-based signal building, lag estimation, peak matching) used only by the [deprecated](#deprecated) pairing scripts. |

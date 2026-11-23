@@ -301,6 +301,41 @@ def run_computation(superdir: Path, rfreq: float | None,
     return rows, cal, out_path
 
 
+_OUTPUT_RE = re.compile(r'^\d{8}_\d{6}_baseline_density\.csv$')
+
+
+def load_latest_output(superdir: Path) -> tuple[list, dict, Path] | None:
+    """
+    (rows, cal, csv_path) from the newest <timestamp>_baseline_density.csv
+    in superdir — rows in attach_rfreq()'s shape, cal with the slope /
+    intercept it was computed with — or None if there is none (or it can't
+    be read). Lets the GUI show a previous result without recomputing (and
+    writing yet another CSV).
+    """
+    superdir = Path(superdir)
+    try:
+        csvs = sorted(f for f in superdir.iterdir()
+                      if f.is_file() and _OUTPUT_RE.match(f.name))
+    except OSError:
+        return None
+    if not csvs:
+        return None
+    try:
+        df = pd.read_csv(csvs[-1])
+        rows = []
+        if 'rfreq_source' not in df.columns:      # CSVs from before per-sample rfreq
+            df['rfreq_source'] = 'user'
+        for r in df.itertuples(index=False):
+            rsrc = '' if pd.isna(r.rfreq_source) else str(r.rfreq_source)
+            rows.append((str(r.sample), int(r.n_cells), float(r.mean_avg_baseline),
+                         str(r.source_csv), float(r.rfreq), rsrc))
+        cal = {'slope': float(df['slope'].iloc[0]), 'intercept': float(df['intercept'].iloc[0])}
+    except (OSError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        print(f"  [warn] could not read {csvs[-1].name}: {exc}")
+        return None
+    return rows, cal, csvs[-1]
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -451,6 +486,39 @@ class BaselineDensityGUI(ttk.Frame):
         self._range_label.pack(anchor='w', padx=8, pady=(0, 8))
 
         self._model.add_listener(self._recolor_rows)
+
+        # Show the superdir's last saved result (and its categories) as soon
+        # as a directory is chosen, so resuming doesn't need a re-Run.
+        self._loaded_dir: str | None = None
+        self._autoload_job = None
+        self._superdir.trace_add('write', lambda *_a: self._schedule_autoload())
+        self.after_idle(self._autoload)
+
+    def _schedule_autoload(self):
+        if self._autoload_job is not None:
+            self.after_cancel(self._autoload_job)
+        self._autoload_job = self.after(400, self._autoload)
+
+    def _autoload(self):
+        self._autoload_job = None
+        text = self._superdir.get().strip()
+        if not text or not Path(text).is_dir():
+            return
+        key = density_categories._norm(text)
+        if key == self._loaded_dir:
+            return
+        loaded = load_latest_output(Path(text))
+        self._loaded_dir = key
+        if loaded is None:
+            return
+        rows, cal, csv_path = loaded
+        per_sample = any(r[5] != 'user' for r in rows)
+        self._per_sample.set(per_sample)
+        self._update_rfreq_entry()
+        self._populate_table(rows, cal, per_sample)
+        self._message.configure(
+            text=f'Showing the saved result {csv_path.name} — Run to recalculate.',
+            foreground='#555')
 
     def _place_sash(self, event):
         # Sidebar starts at ~22% of the width; after that the user owns the sash.
@@ -691,7 +759,9 @@ class BaselineDensityGUI(ttk.Frame):
         missing = [r[0] for r in rows if not np.isfinite(r[4])]
         self._message.configure(text=(
             f"No readable *_reference_values.json for {len(missing)} sample(s), "
-            f"left out of the average: {', '.join(missing)}") if missing else '')
+            f"left out of the average: {', '.join(missing)}") if missing else '',
+            foreground='#a00')
+        self._loaded_dir = density_categories._norm(superdir)
         self._populate_table(rows, cal, per_sample)
         messagebox.showinfo('Baseline Density Calculator', f'Written:\n{out_path}')
 

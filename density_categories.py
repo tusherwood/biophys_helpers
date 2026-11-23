@@ -143,7 +143,9 @@ class CategoryModel:
             self._load()
         self._assign = {s: c for s, c in self._assign.items() if s in self.samples}
         self._drop_empty()
-        self._changed()
+        # Loading (or reloading) changes no assignment the user made, so it
+        # doesn't rewrite density_categories.json; only edits do.
+        self._changed(save=False)
 
     # -- queries --------------------------------------------------------------
 
@@ -759,6 +761,13 @@ class ReviewPage(ttk.Frame):
 
     def _mark_dirty(self):
         self._dirty = True
+        # Categories loaded / edited while this page is on screen: redraw
+        # soon (coalesced), rather than at the next 30 s poll.
+        if self.winfo_exists() and self.winfo_ismapped() and not getattr(self, '_redraw_job', None):
+            def redraw():
+                self._redraw_job = None
+                self.refresh_status()
+            self._redraw_job = self.after(200, redraw)
 
     def _poll(self):
         if not self.winfo_exists():

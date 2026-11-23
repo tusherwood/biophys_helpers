@@ -144,6 +144,7 @@ Usage:
     python compile_experiment.py <superdir> --no-vqvae    # skip the crop caches
 """
 import argparse
+import json
 import re
 import sys
 from datetime import datetime
@@ -651,6 +652,66 @@ def compile_experiment(superdir: Path) -> list[dict]:
 # Annotation + Coulter association GUI
 # ---------------------------------------------------------------------------
 
+ANNOTATIONS_FILENAME = 'compile_annotations.json'
+_COMPILED_DIR_RE = re.compile(r'^\d{8}[._]\d{6}_compiled$')
+
+
+def _annotation_sources(superdir: Path) -> tuple[Path, Path | None]:
+    """(compile_annotations.json path, the newest *_compiled dir's
+    experiment_data.xlsx or None) — CompileAnnotationWindow's state_path /
+    seed_xlsx."""
+    compiled = sorted(d for d in superdir.iterdir()
+                      if d.is_dir() and _COMPILED_DIR_RE.match(d.name))
+    seed = compiled[-1] / 'experiment_data.xlsx' if compiled else None
+    return superdir / ANNOTATIONS_FILENAME, (seed if seed and seed.is_file() else None)
+
+
+def _annotations_from_workbook(xlsx_path: Path) -> dict | None:
+    """
+    Annotation state (CompileAnnotationWindow's compile_annotations.json
+    shape) recovered from a compiled workbook's metadata sheet: its meta_
+    columns (a column holding only yes/no becomes a checkbox column), row
+    order and coulter_column. None if the sheet can't be read.
+    """
+    try:
+        meta = pd.read_excel(xlsx_path, sheet_name='metadata')
+    except Exception as exc:
+        print(f"  [warn] could not read annotations from {xlsx_path}: {exc}")
+        return None
+    if 'sample_name' not in meta.columns:
+        return None
+
+    def text(v):
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return ''
+        if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
+            return '%.10g' % v
+        return str(v).strip()
+
+    cols, checkbox = [], set()
+    for c in meta.columns:
+        if not str(c).startswith('meta_'):
+            continue
+        name = str(c)[len('meta_'):]
+        cols.append(name)
+        vals = {text(v).lower() for v in meta[c]} - {''}
+        if vals and vals <= {'yes', 'no'}:
+            checkbox.add(name)
+    values = {}
+    for _, row in meta.iterrows():
+        values[str(row['sample_name'])] = {
+            name: (('yes' if text(row[f'meta_{name}']).lower() == 'yes' else '')
+                   if name in checkbox else text(row[f'meta_{name}']))
+            for name in cols}
+    coulter = {}
+    if 'coulter_column' in meta.columns:
+        coulter = {str(r['sample_name']): text(r['coulter_column'])
+                   for _, r in meta.iterrows() if text(r['coulter_column'])}
+    return {'custom_cols': cols, 'checkbox_cols': sorted(checkbox), 'column_sources': {},
+            'order': [str(s) for s in meta['sample_name']], 'values': values,
+            'coulter': coulter}
+
+
 class CompileAnnotationWindow(ttk.Frame):
     """
     Spreadsheet-style GUI over every discovered sample.
@@ -695,14 +756,28 @@ class CompileAnnotationWindow(ttk.Frame):
     its Apply adds/fills them here as one undoable step. `column_sources`
     ({column: parser rule}) records which columns came from it, for the
     workbook's README sheet. `auto_detect_on_open` opens that dialog as soon
-    as the table appears (the analysis wizard does).
+    as the table appears (the analysis wizard does) — unless annotations were
+    restored, see below.
+
+    Persistence: with `state_path` (compile_annotations.json in the
+    experiment dir), every change — cell edits, Set Cells, columns added /
+    removed, auto-detect, Undo, row order — is saved there, and a new window
+    restores it, so re-compiling (e.g. after re-gating) doesn't mean
+    re-annotating. Samples no longer present are dropped, new ones start
+    blank. With no saved file, `seed_xlsx` (the previous compile's
+    experiment_data.xlsx) seeds the table from its metadata sheet's meta_
+    columns (yes/no-only columns become checkboxes) and coulter_column.
     """
 
     def __init__(self, parent: tk.Widget, sample_names: list,
                  volume_names, coulter_cols: list, on_result=None,
-                 auto_detect_on_open: bool = False):
+                 auto_detect_on_open: bool = False,
+                 state_path: Path | None = None,
+                 seed_xlsx: Path | None = None):
         super().__init__(parent)
         self._on_result = on_result
+        self._state_path = Path(state_path) if state_path else None
+        self._save_job = None
         self._samples = list(sample_names)
         self._volume_names = set(volume_names)
         self._coulter_cols = list(coulter_cols)
@@ -728,10 +803,92 @@ class CompileAnnotationWindow(ttk.Frame):
 
         self.title = ('Annotate & associate samples' if self._has_coulter
                      else 'Annotate samples')
+        restored = self._restore(seed_xlsx)
         self._build_ui()
+        if restored:
+            self._restore_label.config(text=restored)
+        self._setup_columns()
         self._populate_table()
-        if auto_detect_on_open:
+        if auto_detect_on_open and not restored:
             self.after_idle(self._auto_detect)
+
+    # ------------------------------------------------------------------
+    # Persistence (compile_annotations.json / previous compile)
+    # ------------------------------------------------------------------
+
+    def _restore(self, seed_xlsx) -> str:
+        """Load saved annotations (or seed from a previous compile); returns
+        a one-line description of what was restored, '' if nothing."""
+        state, origin = None, ''
+        if self._state_path is not None and self._state_path.is_file():
+            try:
+                state = json.loads(self._state_path.read_text(encoding='utf-8'))
+                saved = datetime.fromtimestamp(self._state_path.stat().st_mtime)
+                origin = f'{self._state_path.name} (saved {saved:%Y-%m-%d %H:%M})'
+            except (OSError, ValueError) as exc:
+                print(f"  [warn] could not read {self._state_path}: {exc}")
+                state = None
+        if state is None and seed_xlsx is not None and Path(seed_xlsx).is_file():
+            state = _annotations_from_workbook(Path(seed_xlsx))
+            if state is not None:
+                origin = f'the previous compile ({Path(seed_xlsx).parent.name})'
+        if not state:
+            return ''
+
+        cols = [c for c in state.get('custom_cols', []) if isinstance(c, str)
+                and c not in ('sample', 'coulter_col')]
+        self._custom_cols = list(dict.fromkeys(cols))
+        self._checkbox_cols = {c for c in state.get('checkbox_cols', []) if c in self._custom_cols}
+        self.column_sources = {c: s for c, s in (state.get('column_sources') or {}).items()
+                               if c in self._custom_cols}
+        values = state.get('values') or {}
+        coulter = state.get('coulter') or {}
+        n_restored = 0
+        for s in self._samples:
+            rd = self._row_data[s]
+            sv = values.get(s)
+            if sv is not None:
+                n_restored += 1
+            for c in self._custom_cols:
+                v = '' if sv is None else str(sv.get(c, '') or '')
+                rd[c] = ('yes' if v == 'yes' else '') if c in self._checkbox_cols else v
+            if self._has_coulter and coulter.get(s) in self._coulter_cols:
+                rd['coulter_col'] = coulter[s]
+        order = [s for s in state.get('order', []) if s in self._row_data]
+        self._samples = order + [s for s in self._samples if s not in order]
+        new = len(self._samples) - n_restored
+        text = (f'Restored {len(self._custom_cols)} column(s) for {n_restored} sample(s) '
+                f'from {origin}.')
+        if new:
+            text += (f' {new} new sample(s) start blank — Auto-detect from names can fill '
+                     f'them in.')
+        return text
+
+    def _schedule_save(self):
+        """Save once the current action has finished updating the table."""
+        if self._state_path is not None and self._save_job is None:
+            self._save_job = self.after_idle(self._save_state)
+
+    def _save_state(self):
+        self._save_job = None
+        if self._state_path is None:
+            return
+        state = {
+            'version': 1,
+            'saved': datetime.now().isoformat(timespec='seconds'),
+            'custom_cols': list(self._custom_cols),
+            'checkbox_cols': sorted(self._checkbox_cols),
+            'column_sources': dict(self.column_sources),
+            'order': list(self._tree.get_children()),
+            'values': {s: {c: self._row_data[s].get(c, '') for c in self._custom_cols}
+                       for s in self._samples},
+            'coulter': {s: self._row_data[s].get('coulter_col', '') for s in self._samples
+                        if self._row_data[s].get('coulter_col')},
+        }
+        try:
+            self._state_path.write_text(json.dumps(state, indent=1), encoding='utf-8')
+        except OSError as exc:
+            print(f"  [warn] could not save annotations to {self._state_path}: {exc}")
 
     # ------------------------------------------------------------------
     # Column lists
@@ -756,6 +913,10 @@ class CompileAnnotationWindow(ttk.Frame):
             self, text=header,
             font=('TkDefaultFont', 10, 'bold'), anchor='w',
         ).pack(fill=tk.X, padx=10, pady=(8, 2))
+        # Filled in by __init__ when annotations were restored (see _restore).
+        self._restore_label = tk.Label(self, text='', fg='#14532d', anchor='w',
+                                       justify='left')
+        self._restore_label.pack(fill=tk.X, padx=10, pady=(0, 2))
 
         # 'clam' renders Treeview row-tag backgrounds reliably (the macOS aqua
         # theme ignores them), which the zebra striping below relies on.
@@ -1088,14 +1249,17 @@ class CompileAnnotationWindow(ttk.Frame):
     # ------------------------------------------------------------------
 
     def _push_undo(self, changes: list):
-        """Record a completed action's prior cell values for later undo."""
+        """Record a completed action's prior cell values for later undo.
+        Every edit passes through here, so it also schedules the save."""
         self._undo_stack.append(changes)
         self._undo_btn.config(state=tk.NORMAL)
+        self._schedule_save()
 
     def _clear_undo(self):
         """Drop undo history (used when columns are added/removed)."""
         self._undo_stack.clear()
         self._undo_btn.config(state=tk.DISABLED)
+        self._schedule_save()
 
     def _undo(self):
         """Revert the most recent cell edit or bulk Set Cells action."""
@@ -1132,6 +1296,7 @@ class CompileAnnotationWindow(ttk.Frame):
         if not self._undo_stack:
             self._undo_btn.config(state=tk.DISABLED)
         self._check_done()
+        self._schedule_save()
 
     # ------------------------------------------------------------------
     # Auto-detect from sample names
@@ -1247,9 +1412,8 @@ class CompileAnnotationWindow(ttk.Frame):
             self._checkbox_cols.add(name)
         for rd in self._row_data.values():
             rd[name] = ''
+        self._rebuild_table()
         self._clear_undo()
-        self._setup_columns()
-        self._populate_table()
 
     def _remove_column(self):
         if not self._custom_cols:
@@ -1301,9 +1465,8 @@ class CompileAnnotationWindow(ttk.Frame):
         self.column_sources.pop(name, None)
         for rd in self._row_data.values():
             rd.pop(name, None)
+        self._rebuild_table()
         self._clear_undo()
-        self._setup_columns()
-        self._populate_table()
 
     def _set_cells(self):
         if not self._custom_cols:
@@ -1421,6 +1584,7 @@ class CompileAnnotationWindow(ttk.Frame):
             if idx > 0:
                 self._tree.move(item, '', idx - 1)
         self._restripe()
+        self._schedule_save()
 
     def _move_down(self):
         children = self._tree.get_children()
@@ -1430,12 +1594,18 @@ class CompileAnnotationWindow(ttk.Frame):
             if idx < n - 1:
                 self._tree.move(item, '', idx + 1)
         self._restripe()
+        self._schedule_save()
 
     # ------------------------------------------------------------------
     # Finish / close
     # ------------------------------------------------------------------
 
     def _finish(self):
+        # Save now (not on idle) so the saved annotations predate the compiled
+        # dir — experiment_status would otherwise call the compile stale.
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        self._save_state()
         ordered_samples = list(self._tree.get_children())
         pairing = {s: self._row_data[s].get('coulter_col', '')
                   for s in self._samples}
@@ -1852,9 +2022,10 @@ def main():
 
     ann_root = tk.Tk()
     volume_names = {r['name'] for r in records if r['has_volume']}
+    state_path, seed_xlsx = _annotation_sources(superdir)
     aw = CompileAnnotationWindow(
         ann_root, [r['name'] for r in records], volume_names, coulter_cols,
-        on_result=on_result)
+        on_result=on_result, state_path=state_path, seed_xlsx=seed_xlsx)
     ann_root.title(aw.title)
     aw.pack(fill=tk.BOTH, expand=True)
     ann_root.protocol('WM_DELETE_WINDOW', aw.handle_close)
@@ -1868,7 +2039,8 @@ def main():
 def build_embedded_page(parent: tk.Widget, *,
                         initial_superdir: str | None = None,
                         on_done=None,
-                        auto_detect_names: bool = False) -> ttk.Frame:
+                        auto_detect_names: bool = False,
+                        records_provider=None) -> ttk.Frame:
     """
     Build this tool's discover-and-compile UI as a Frame suitable for
     embedding in a larger application, e.g. a wizard page.
@@ -1885,7 +2057,11 @@ def build_embedded_page(parent: tk.Widget, *,
     this as its final page can pass its own root.destroy to close on Done.
 
     `auto_detect_names` opens the "Auto-detect from names" dialog each time
-    Discover Samples builds a fresh annotation table.
+    Discover Samples builds a fresh annotation table (unless saved
+    annotations were restored — see CompileAnnotationWindow).
+    `records_provider(superdir) -> records`, if given, replaces the call to
+    compile_experiment() — the wizard passes its sample_qc.RecordsCache so
+    samples already loaded for QC aren't loaded again.
     """
     page = ttk.Frame(parent)
 
@@ -1961,7 +2137,8 @@ def build_embedded_page(parent: tk.Widget, *,
                 return
             coulter_cols = list(_load_coulter(coulter_path).columns)
 
-        records = compile_experiment(superdir)
+        records = (records_provider(superdir) if records_provider is not None
+                   else compile_experiment(superdir))
         if not records:
             _set_status(f'No sample data found under {superdir}.')
             return
@@ -1988,10 +2165,12 @@ def build_embedded_page(parent: tk.Widget, *,
                 on_done()
 
         volume_names = {r['name'] for r in records if r['has_volume']}
+        state_path, seed_xlsx = _annotation_sources(superdir)
         aw = CompileAnnotationWindow(
             panel_container, [r['name'] for r in records], volume_names,
             coulter_cols, on_result=on_result,
-            auto_detect_on_open=auto_detect_names)
+            auto_detect_on_open=auto_detect_names,
+            state_path=state_path, seed_xlsx=seed_xlsx)
         aw.pack(fill=tk.BOTH, expand=True)
 
     ttk.Button(top, text='Discover Samples', command=_discover).grid(
