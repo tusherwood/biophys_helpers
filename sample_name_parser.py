@@ -36,12 +36,19 @@ A second match of the same rule in one name goes to suffixed columns
 (drug_2 / dose_uM_2). Column names follow the plotting plugin's role
 conventions (time_h -> time, dose_uM -> ordered gradient, yes/no -> boolean).
 
+check_names() summarises a parse for a quick up-front check (the analysis
+wizard's Overview): columns found, unrecognised tokens, and tokens that look
+like typos of a known word (a rare leftover close in spelling to a rule
+synonym or to a token recognised in another sample, e.g. 'prolfi' ~ 'prolif'),
+plus near-identical values within one text column (drug 'wnk436' / 'wnk463').
+
 Pure Python, no GUI; auto_metadata_dialog.py is the review dialog that
 compile_experiment.py's annotation table opens.
 """
 from __future__ import annotations
 
 import copy
+import difflib
 import json
 import re
 from dataclasses import dataclass, field
@@ -315,3 +322,86 @@ def add_ignored(rules: dict, tokens: list) -> dict:
     rules = copy.deepcopy(rules)
     rules['ignore'] = sorted(set(rules.get('ignore', [])) | set(tokens), key=str.lower)
     return rules
+
+
+# ---------------------------------------------------------------------------
+# Up-front name check
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NameCheck:
+    n_names: int
+    columns: list             # proposed column names
+    leftovers: dict           # token -> number of samples it is unrecognised in
+    typos: dict               # token -> the known word it closely resembles
+    samples_with_leftovers: list
+    value_typos: list = field(default_factory=list)
+    # [(column, value, similar value)]: two values of one text column (e.g.
+    # drug 'wnk436' / 'wnk463') spelled almost alike, at least one rare
+
+    @property
+    def ok(self) -> bool:
+        return not self.leftovers
+
+
+TYPO_MAX_SAMPLES = 2     # a leftover seen in more samples than this is a word, not a typo
+TYPO_CUTOFF = 0.75       # difflib similarity ratio
+
+
+def _similar_values(a: str, b: str) -> bool:
+    """Spelled almost alike. Values differing only in their digits are
+    different quantities ('150mM' / '180mM') unless the digits are merely
+    transposed ('wnk436' / 'wnk463')."""
+    a, b = a.lower(), b.lower()
+    if difflib.SequenceMatcher(None, a, b).ratio() < TYPO_CUTOFF:
+        return False
+    if re.sub(r'\d', '', a) == re.sub(r'\d', '', b):
+        return sorted(a) == sorted(b)
+    return True
+
+
+def check_names(names: list, rules: dict | None = None) -> NameCheck:
+    """Parse `names` and summarise what a user should look at before
+    analysing: unrecognised tokens and likely typos among them."""
+    rules = rules if rules is not None else load_rules()
+    result = parse_names(names, rules)
+    counts = result.leftover_counts()
+
+    vocab: set = set()
+    for rule in rules.get('words', []):
+        for value, synonyms in rule['values'].items():
+            vocab.update(str(s).lower() for s in [value, *synonyms])
+    for pairs in result.recognised.values():
+        vocab.update(tok.lower() for tok, _col in pairs)
+    # Leftovers common enough to be deliberate are words too.
+    vocab.update(t.lower() for t, n in counts.items() if n > TYPO_MAX_SAMPLES)
+
+    typos = {}
+    for token, n in counts.items():
+        if n > TYPO_MAX_SAMPLES or len(token) < 3:
+            continue
+        low = token.lower()
+        candidates = [w for w in vocab if w != low]
+        match = next((w for w in difflib.get_close_matches(low, candidates, n=5,
+                                                           cutoff=TYPO_CUTOFF)
+                      if _similar_values(low, w)), None)
+        if match:
+            typos[token] = match
+
+    value_typos = []
+    for col in result.columns:
+        if col.kind != TEXT:
+            continue
+        vcounts: dict = {}
+        for v in col.values.values():
+            if v:
+                vcounts[v] = vcounts.get(v, 0) + 1
+        values = sorted(vcounts)
+        for i, a in enumerate(values):
+            for b in values[i + 1:]:
+                if (min(vcounts[a], vcounts[b]) <= TYPO_MAX_SAMPLES and len(a) >= 3
+                        and _similar_values(a, b)):
+                    rare, common = (a, b) if vcounts[a] <= vcounts[b] else (b, a)
+                    value_typos.append((col.name, rare, common))
+    return NameCheck(len(names), [c.name for c in result.columns], counts, typos,
+                     [n for n, left in result.leftovers.items() if left], value_typos)

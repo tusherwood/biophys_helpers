@@ -133,9 +133,12 @@ class NewAnalysisPanel(ttk.Frame):
     Standalone (raw_dir_var=None): step 1 is a filterable list of RAW_DATA_DIR's subdirs.
     Embedded (raw_dir_var given): step 1 is just that variable's dir plus a Create button.
     `on_close` is what the Close button (and on_close() once any copy is cancelled) calls.
+    `on_created(raw_dir, code_dir, data_dir)` / `on_copied(data_dir, jobs)` are optional
+    hooks called after Create and after a copy completes (jobs: [(source, destination)]).
     """
 
-    def __init__(self, parent, initial_filter="", raw_dir_var=None, on_close=None):
+    def __init__(self, parent, initial_filter="", raw_dir_var=None, on_close=None,
+                 on_created=None, on_copied=None):
         super().__init__(parent, padding=12)
         self.name = None
         self.data_dir = None
@@ -149,6 +152,9 @@ class NewAnalysisPanel(ttk.Frame):
         self.cur_bytes = ""
         self.raw_dir_var = raw_dir_var
         self._quit = on_close or self.winfo_toplevel().destroy
+        self._on_created = on_created
+        self._on_copied = on_copied
+        self.jobs = []
 
         outer = self
         outer.columnconfigure(0, weight=1)
@@ -299,6 +305,8 @@ class NewAnalysisPanel(ttk.Frame):
         self.created_lbl.config(text="\n".join(
             f"Created {p}" for p in (code_dir, data_dir / "fig", data_dir / "data")))
         self.show_discovery(raw_dir)
+        if self._on_created is not None:
+            self._on_created(raw_dir, code_dir, data_dir)
 
     # ------------------------------------------------------------- discovery --
     def show_discovery(self, raw_dir):
@@ -391,6 +399,7 @@ class NewAnalysisPanel(ttk.Frame):
                 for i, (t, var, *_) in enumerate(self.rows) if var.get()]
         if not jobs:
             return
+        self.jobs = jobs
         for w in self.disc.winfo_children():
             self._set_enabled(w, False)
         self.close_btn.state(["!disabled"])
@@ -439,6 +448,8 @@ class NewAnalysisPanel(ttk.Frame):
             self.progress["value"] = 1.0
             self.status.config(text=f"Copied {finished[1]} files ({fmt_bytes(finished[2])}) "
                                     f"into {self.data_dir}", foreground="darkgreen")
+            if self._on_copied is not None and not self.quit_when_done:
+                self._on_copied(self.data_dir, list(self.jobs))
         elif kind == "cancelled":
             self.status.config(text="Copy cancelled; already-copied files were left in place.",
                                foreground="firebrick")
@@ -447,6 +458,18 @@ class NewAnalysisPanel(ttk.Frame):
             messagebox.showerror("Copy failed", finished[1], parent=self)
         if self.quit_when_done:
             self._quit()
+
+    def primary_action(self):
+        """Create (embedded, before creating), else Copy if it is available."""
+        if self.data_dir is None:
+            if self.raw_dir_var is not None and self.create_btn.instate(["!disabled"]):
+                self.create(self._var_raw_dir())
+        elif (hasattr(self, "copy_btn") and self.copy_btn.winfo_manager()
+              and self.copy_btn.instate(["!disabled"])):
+            self.start_copy()
+
+    def is_busy(self):
+        return bool(self.worker and self.worker.is_alive())
 
     def on_close(self):
         """Close, first cancelling (and waiting out) any in-progress copy.
@@ -464,17 +487,20 @@ class NewAnalysisPanel(ttk.Frame):
         self._quit()
 
 
-def build_embedded_page(parent, *, raw_dir_var, on_close=None):
+def build_embedded_page(parent, *, raw_dir_var, on_close=None, on_created=None,
+                        on_copied=None):
     """Build this tool's panel for embedding in a larger app, e.g. a wizard page.
 
     `raw_dir_var` (a tk.StringVar holding the raw data dir) stands in for the
     standalone list picker: its dir's name becomes the analysis name, and its
     *_compiled / *_gating_summary subdirs are what's offered for copying.
     `on_close` is called by the Close button (default: destroy the toplevel).
+    `on_created` / `on_copied`: see NewAnalysisPanel.
     Returns the NewAnalysisPanel, whose on_close() the host should also bind
     to its window's close button.
     """
-    return NewAnalysisPanel(parent, raw_dir_var=raw_dir_var, on_close=on_close)
+    return NewAnalysisPanel(parent, raw_dir_var=raw_dir_var, on_close=on_close,
+                            on_created=on_created, on_copied=on_copied)
 
 
 def main():

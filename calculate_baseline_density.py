@@ -56,6 +56,12 @@ lists each category's mean density and members, with a Copy button whose
 payload SMRFXMAnalysis' batch window takes via "Paste category". Categories
 are saved to <superdir>/density_categories.json on every change and restored
 when that superdir is computed again. See density_categories.py.
+
+The GUI's calibration field fills itself while it is empty (or still holds an
+automatic pick): with the newest <date>_density_baseline_calibration.json
+directly in the superdir, else with the calibration of the last successful
+run (remembered in ~/.biophys_helpers/wizard_state.json). A note under the
+field says which; typing or Browse always wins and is never replaced.
 """
 import argparse
 import json
@@ -69,6 +75,7 @@ import numpy as np
 import pandas as pd
 
 import density_categories
+import user_state
 from fsutil import is_appledouble
 
 
@@ -119,6 +126,20 @@ def load_calibration(path: Path) -> dict:
     print(f"Calibration ({cal.get('date', 'no date')}): "
           f"slope={cal['slope']:.6g}  intercept={cal['intercept']:.6g}")
     return cal
+
+
+CALIBRATION_GLOB = '*_density_baseline_calibration.json'
+
+
+def find_experiment_calibration(superdir) -> Path | None:
+    """The newest <date>_density_baseline_calibration.json directly inside
+    `superdir` (by name — the date prefix — then mtime), or None."""
+    try:
+        found = [p for p in Path(superdir).glob(CALIBRATION_GLOB)
+                 if p.is_file() and not is_appledouble(p)]
+        return max(found, key=lambda p: (p.name, p.stat().st_mtime)) if found else None
+    except OSError:
+        return None
 
 
 def apply_calculation(mean_baseline: float, cal: dict, rfreq: float) -> float:
@@ -374,11 +395,19 @@ class BaselineDensityGUI(ttk.Frame):
                  calib_json: str | None, rfreq: float | None,
                  superdir_var: tk.StringVar | None = None,
                  per_sample_rfreq: bool = False,
-                 category_model: density_categories.CategoryModel | None = None):
+                 category_model: density_categories.CategoryModel | None = None,
+                 on_computed=None):
         super().__init__(parent)
 
         self._superdir = superdir_var if superdir_var is not None else tk.StringVar(value=superdir or '')
         self._calib_json = tk.StringVar(value=calib_json or '')
+        # Where the calibration path came from: 'user' (typed / Browse / CLI —
+        # never replaced), 'folder' or 'last' (automatic picks, re-resolved
+        # when the directory changes), or None (empty).
+        self._calib_source = 'user' if calib_json else None
+        self._calib_setting = False
+        self._calib_json.trace_add('write', lambda *_a: self._calib_edited())
+        self._on_computed = on_computed
         self._rfreq = tk.StringVar(value='' if rfreq is None else f'{rfreq:g}')
         self._per_sample = tk.BooleanVar(value=per_sample_rfreq)
         self._checked: dict[str, bool] = {}
@@ -395,6 +424,7 @@ class BaselineDensityGUI(ttk.Frame):
         self._panes.add(self._sidebar, weight=1)
         self._sash_placed = False
         self._panes.bind('<Configure>', self._place_sash)
+        self._panes.bind('<ButtonRelease-1>', self._save_sash, add='+')
 
         pad = {'padx': 8, 'pady': 6}
         form = ttk.Frame(root)
@@ -408,21 +438,23 @@ class BaselineDensityGUI(ttk.Frame):
         ttk.Label(form, text='Calibration JSON:').grid(row=1, column=0, sticky='w', pady=(6, 0))
         ttk.Entry(form, textvariable=self._calib_json).grid(row=1, column=1, sticky='ew', padx=(6, 6), pady=(6, 0))
         ttk.Button(form, text='Browse…', command=self._pick_calib_json).grid(row=1, column=2, pady=(6, 0))
+        self._calib_note = ttk.Label(form, text='', foreground='#666')
+        self._calib_note.grid(row=2, column=1, columnspan=2, sticky='w', padx=(6, 6))
 
         ttk.Checkbutton(
             form, variable=self._per_sample,
             text="Use per-sample reference frequency (from each sample's "
                  "*_reference_values.json)",
-            command=self._update_rfreq_entry).grid(
-            row=2, column=1, columnspan=2, sticky='w', padx=(6, 6), pady=(6, 0))
+            command=self._per_sample_toggled).grid(
+            row=3, column=1, columnspan=2, sticky='w', padx=(6, 6), pady=(6, 0))
 
-        ttk.Label(form, text='Reference frequency (Hz):').grid(row=3, column=0, sticky='w', pady=(6, 0))
+        ttk.Label(form, text='Reference frequency (Hz):').grid(row=4, column=0, sticky='w', pady=(6, 0))
         self._rfreq_entry = ttk.Entry(form, textvariable=self._rfreq, width=16)
-        self._rfreq_entry.grid(row=3, column=1, sticky='w', padx=(6, 6), pady=(6, 0))
+        self._rfreq_entry.grid(row=4, column=1, sticky='w', padx=(6, 6), pady=(6, 0))
         self._update_rfreq_entry()
 
         self._run_button = ttk.Button(form, text='Run', command=self._run)
-        self._run_button.grid(row=4, column=1, sticky='w', pady=(10, 0))
+        self._run_button.grid(row=5, column=1, sticky='w', pady=(10, 0))
 
         self._message = ttk.Label(root, text='', foreground='#a00')
         self._message.pack(fill=tk.X, padx=8)
@@ -494,6 +526,59 @@ class BaselineDensityGUI(ttk.Frame):
         self._superdir.trace_add('write', lambda *_a: self._schedule_autoload())
         self.after_idle(self._autoload)
 
+    # -- calibration auto-pick ----------------------------------------------
+
+    def _calib_edited(self):
+        if self._calib_setting:
+            return
+        # Typed or browsed: the user's choice from now on (until cleared).
+        self._calib_source = 'user' if self._calib_json.get().strip() else None
+        self._calib_note.configure(text='')
+
+    def _set_calib(self, path: str, source: str | None, note: str):
+        self._calib_setting = True
+        try:
+            self._calib_json.set(path)
+        finally:
+            self._calib_setting = False
+        self._calib_source = source
+        self._calib_note.configure(text=note)
+
+    def _auto_calibration(self, superdir: Path | None):
+        """Fill the calibration field unless the user chose it: the newest
+        calibration JSON in the experiment folder, else the last one used."""
+        if self._calib_source == 'user':
+            return
+        found = find_experiment_calibration(superdir) if superdir is not None else None
+        if found is not None:
+            self._set_calib(str(found), 'folder',
+                            f'Found in the experiment folder ({found.name}) — Browse to change.')
+            return
+        last = user_state.get('last_calibration')
+        if isinstance(last, str) and last and Path(last).is_file():
+            self._set_calib(last, 'last',
+                            'None in the experiment folder — using the calibration from the '
+                            'last run. Browse to change.')
+        elif self._calib_source is not None:
+            self._set_calib('', None, '')
+
+    # -- remembered layout / options ----------------------------------------
+
+    def _per_sample_toggled(self):
+        self._update_rfreq_entry()
+        user_state.update(per_sample_rfreq=bool(self._per_sample.get()))
+
+    def _save_sash(self, _event=None):
+        try:
+            width = self._panes.winfo_width()
+            sidebar = width - self._panes.sashpos(0)
+        except tk.TclError:
+            return
+        if width > 100 and sidebar > 0:
+            user_state.update(baseline_sidebar_width=int(sidebar))
+
+    # -- autoload --------------------------------------------------------------
+
     def _schedule_autoload(self):
         if self._autoload_job is not None:
             self.after_cancel(self._autoload_job)
@@ -503,7 +588,9 @@ class BaselineDensityGUI(ttk.Frame):
         self._autoload_job = None
         text = self._superdir.get().strip()
         if not text or not Path(text).is_dir():
+            self._auto_calibration(None)
             return
+        self._auto_calibration(Path(text))
         key = density_categories._norm(text)
         if key == self._loaded_dir:
             return
@@ -521,10 +608,15 @@ class BaselineDensityGUI(ttk.Frame):
             foreground='#555')
 
     def _place_sash(self, event):
-        # Sidebar starts at ~22% of the width; after that the user owns the sash.
+        # Sidebar starts at its remembered width (else ~22% of the width);
+        # after that the user owns the sash.
         if not self._sash_placed and event.width > 100:
             self._sash_placed = True
-            self._panes.sashpos(0, int(event.width * 0.78))
+            saved = user_state.get('baseline_sidebar_width')
+            if isinstance(saved, int) and 150 <= saved <= event.width - 400:
+                self._panes.sashpos(0, event.width - saved)
+            else:
+                self._panes.sashpos(0, int(event.width * 0.78))
 
     def _pick_superdir(self):
         chosen = filedialog.askdirectory(title='Select experiment superdir',
@@ -763,7 +855,24 @@ class BaselineDensityGUI(ttk.Frame):
             foreground='#a00')
         self._loaded_dir = density_categories._norm(superdir)
         self._populate_table(rows, cal, per_sample)
+        user_state.update(last_calibration=str(calib_json))
+        if self._on_computed is not None:
+            source = {'folder': 'found in the experiment folder',
+                      'last': 'last used'}.get(self._calib_source, 'chosen manually')
+            try:
+                self._on_computed({
+                    'superdir': superdir, 'calib_json': calib_json, 'calib_source': source,
+                    'slope': cal['slope'], 'intercept': cal['intercept'],
+                    'per_sample': per_sample, 'rfreq': rfreq, 'out_path': out_path,
+                    'n_samples': len(rows), 'missing_rfreq': missing})
+            except Exception as exc:   # a host hook must not break the calculator
+                print(f'  [warn] on_computed failed: {exc}')
         messagebox.showinfo('Baseline Density Calculator', f'Written:\n{out_path}')
+
+    def run(self):
+        """Public alias of the Run button (e.g. a host's keyboard shortcut)."""
+        if str(self._run_button['state']) != tk.DISABLED:
+            self._run()
 
 
 def run_gui(*, superdir: str | None, calib_json: str | None, rfreq: float | None,
@@ -787,6 +896,7 @@ def build_embedded_page(parent: tk.Widget, *, superdir: str | None = None,
                         superdir_var: tk.StringVar | None = None,
                         per_sample_rfreq: bool = False,
                         category_model: density_categories.CategoryModel | None = None,
+                        on_computed=None,
                         ) -> ttk.Frame:
     """
     Build this tool's GUI as a Frame suitable for embedding in a larger
@@ -798,12 +908,15 @@ def build_embedded_page(parent: tk.Widget, *, superdir: str | None = None,
     sets the initial state of the per-sample reference-frequency checkbox.
     Pass a `category_model` to share the density categories with other
     pages (the wizard's category review step); otherwise the page keeps its
-    own.
+    own. `on_computed(info)` is called after each successful Run with a dict
+    (superdir, calib_json, calib_source, slope, intercept, per_sample, rfreq,
+    out_path, n_samples, missing_rfreq) — e.g. for the wizard's analysis log.
     """
     return BaselineDensityGUI(parent, superdir=superdir, calib_json=calib_json,
                               rfreq=rfreq, superdir_var=superdir_var,
                               per_sample_rfreq=per_sample_rfreq,
-                              category_model=category_model)
+                              category_model=category_model,
+                              on_computed=on_computed)
 
 
 # ---------------------------------------------------------------------------

@@ -23,7 +23,8 @@ Pieces:
                       copy, expandable sample list) for the density page.
     ReviewPage        full-page grid of category cards with per-sample
                       densities, a Copy button each, and on-disk analysis
-                      status (see sample_analysis_status).
+                      status (see sample_analysis_status), and live
+                      notifications (category analysed, batch window closed).
     BatchWindowLauncher
                       opens SMRFXMAnalysis's batch window directly, already
                       scanned on the experiment dir, in the paella_analysis
@@ -51,6 +52,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
+
+import desktop_notify
+import user_state
 
 CATEGORY_FORMAT = 'biophys_density_category'
 CATEGORY_FORMAT_VERSION = 1
@@ -113,6 +117,7 @@ class CategoryModel:
         self._assign: dict[str, str] = {}          # sample -> category id
         self._listeners: list = []
         self._next_id = 1
+        self.revision = 0      # bumped on every user edit (not on load)
 
     # -- listeners ------------------------------------------------------------
 
@@ -121,6 +126,7 @@ class CategoryModel:
 
     def _changed(self, *, save: bool = True):
         if save:
+            self.revision += 1
             self.save()
         for callback in list(self._listeners):
             callback()
@@ -716,25 +722,43 @@ _STATE_COLORS = {DONE: ('#bbf7d0', '#14532d'), RERUN: ('#fecaca', '#7f1d1d'),
                  PENDING: ('#e5e7eb', '#374151'), NO_IMAGING: ('#f3f4f6', '#6b7280')}
 
 
+_BANNER_COLORS = {'success': ('#dcfce7', '#14532d'), 'info': ('#dbeafe', '#1e3a8a'),
+                  'warn': ('#fef3c7', '#78350f')}
+
+
 class ReviewPage(ttk.Frame):
     """
     The wizard's category review step: a full-page grid of category cards
     (samples, densities, on-disk analysis status, Copy), plus a button to
     (re)open the batch window. `all_analysed()` gates the wizard's Next.
+
+    Live notifications: when a status check finds a category newly analysed
+    (or every category done), or the batch window (`launcher`, a
+    BatchWindowLauncher) exits, a message bar appears at the top, the
+    system notification sound plays (unless muted with the page's "Sound"
+    box, remembered in user_state) and the window's taskbar button flashes
+    if it isn't in front. `on_category_analysed(category)` is called for
+    each category that flips to analysed.
     """
 
     CARD_MIN_WIDTH = 360
     POLL_MS = 30_000
+    WATCH_MS = 2_000
 
     def __init__(self, parent, model: CategoryModel, *, on_open_batch,
-                 on_status_change=None):
+                 on_status_change=None, launcher: 'BatchWindowLauncher | None' = None,
+                 on_category_analysed=None):
         super().__init__(parent)
         self._model = model
         self._on_status_change = on_status_change
+        self._on_category_analysed = on_category_analysed
+        self._launcher = launcher
         self._status: dict[str, CategoryStatus] = {}
+        self._status_dir: str | None = None   # experiment the last status is for
         self._dirty = True
         self._columns = 0
         self._cards: list[tk.Frame] = []
+        self._batch_running = False
 
         bar = ttk.Frame(self)
         bar.pack(fill=tk.X, padx=8, pady=(4, 4))
@@ -743,8 +767,24 @@ class ReviewPage(ttk.Frame):
         ttk.Button(bar, text='Refresh status', command=self.refresh_status).pack(side=tk.RIGHT)
         ttk.Button(bar, text='Open batch analysis window', command=on_open_batch).pack(
             side=tk.RIGHT, padx=(0, 6))
+        self._sound = tk.BooleanVar(master=self, value=bool(user_state.get('notify_sound', True)))
+        ttk.Checkbutton(bar, text='Sound', variable=self._sound,
+                        command=lambda: user_state.update(notify_sound=bool(self._sound.get()))
+                        ).pack(side=tk.RIGHT, padx=(0, 10))
         self._checked_label = ttk.Label(bar, text='', foreground='#555')
         self._checked_label.pack(side=tk.RIGHT, padx=(0, 10))
+
+        # Message bar (hidden until a notification).
+        self._banner = tk.Frame(self, borderwidth=1, relief='solid')
+        self._banner_label = tk.Label(self._banner, text='', anchor='w', justify='left',
+                                      font=('TkDefaultFont', 10, 'bold'))
+        self._banner_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=6)
+        self._banner_close = tk.Button(self._banner, text='✕', relief='flat',
+                                       command=self.dismiss_notification)
+        self._banner_close.pack(side=tk.RIGHT, padx=4)
+        self._banner_log = tk.Button(self._banner, text='Show log', relief='flat',
+                                     command=self._show_batch_log)
+
         self._summary = ttk.Label(self, text='', foreground='#555')
         self._summary.pack(anchor='w', padx=8)
 
@@ -756,6 +796,59 @@ class ReviewPage(ttk.Frame):
         # The owner calls refresh_status() whenever the page is shown; this
         # poll keeps it current while it stays on screen.
         self.after(self.POLL_MS, self._poll)
+        if launcher is not None:
+            self.after(self.WATCH_MS, self._watch_batch)
+
+    # -- notifications ----------------------------------------------------------
+
+    def notify(self, text: str, kind: str = 'info', *, show_log: bool = False,
+               sound: bool = True):
+        """Show `text` in the message bar (replacing any earlier one) and get
+        the user's attention."""
+        bg, fg = _BANNER_COLORS.get(kind, _BANNER_COLORS['info'])
+        for w in (self._banner, self._banner_label, self._banner_close, self._banner_log):
+            w.configure(background=bg)
+        self._banner_label.configure(text=text, foreground=fg)
+        if show_log:
+            self._banner_log.pack(side=tk.RIGHT, padx=4, before=self._banner_close)
+        else:
+            self._banner_log.pack_forget()
+        if not self._banner.winfo_manager():
+            self._banner.pack(fill=tk.X, padx=8, pady=(0, 4), before=self._summary)
+        if sound and self._sound.get():
+            desktop_notify.beep(self)
+        desktop_notify.flash(self)
+
+    def notification_text(self) -> str:
+        return self._banner_label.cget('text') if self._banner.winfo_manager() else ''
+
+    def dismiss_notification(self):
+        self._banner.pack_forget()
+
+    def _show_batch_log(self):
+        if self._launcher is None:
+            return
+        text = self._launcher.log_tail(40) or '(the log is empty)'
+        messagebox.showinfo('Batch window log', f'{text}\n\nFull log: {self._launcher.log_path}',
+                            parent=self)
+
+    def _watch_batch(self):
+        if not self.winfo_exists():
+            return
+        running = self._launcher.is_running()
+        if self._batch_running and not running:
+            code = self._launcher.exit_code()
+            if code not in (None, 0):
+                self.notify(f'The batch window exited with an error (code {code}). '
+                            'Reopen it with "Open batch analysis window".', 'warn',
+                            show_log=True)
+            else:
+                self.notify('Batch window closed — reopen it with "Open batch analysis '
+                            'window" if categories are left.', 'info')
+            if self.winfo_ismapped():
+                self.refresh_status()
+        self._batch_running = running
+        self.after(self.WATCH_MS, self._watch_batch)
 
     # -- status ---------------------------------------------------------------
 
@@ -780,13 +873,43 @@ class ReviewPage(ttk.Frame):
         model = self._model
         status = {c.id: category_status(model, c.id) for c in model.analysis_categories()}
         changed = self._dirty or _status_key(status) != _status_key(self._status)
+        previous = self._status if self._status_dir == _norm(model.superdir or '') else {}
         self._status = status
+        self._status_dir = _norm(model.superdir or '')
+        self._announce(previous, status)
         self._checked_label.configure(text=f"Status checked {datetime.now():%H:%M:%S}")
         if changed:
             self._dirty = False
             self._rebuild()
         if self._on_status_change:
             self._on_status_change()
+
+    def _announce(self, previous: dict, status: dict):
+        """Notify about categories that went from not-analysed (in a previous
+        check of the same experiment) to analysed. The first check of an
+        experiment only establishes the baseline."""
+        flipped = [c for c in self._model.analysis_categories()
+                   if c.id in previous and previous[c.id].state != DONE
+                   and c.id in status and status[c.id].state == DONE]
+        if not flipped:
+            return
+        for cat in flipped:
+            if self._on_category_analysed is not None:
+                try:
+                    self._on_category_analysed(cat)
+                except Exception as exc:
+                    print(f'  [warn] on_category_analysed failed: {exc}')
+        cats = self._model.analysis_categories()
+        left = [c for c in cats if not (c.id in status and status[c.id].state == DONE)]
+        names = ', '.join(c.name for c in flipped)
+        if not left:
+            self.notify(f'✓ {names} analysed — all {len(cats)} categories are done. '
+                        'Next is unlocked.', 'success')
+        else:
+            self.notify(f'✓ {names} analysed — {len(left)} '
+                        f'categor{"y" if len(left) == 1 else "ies"} left: '
+                        f'{", ".join(c.name for c in left[:4])}{"…" if len(left) > 4 else ""}.',
+                        'success')
 
     def all_analysed(self) -> bool:
         cats = self._model.analysis_categories()

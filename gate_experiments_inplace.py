@@ -1304,6 +1304,15 @@ def build_embedded_page(parent: tk.Widget, *,
     superdir_var.trace_add('write', _auto_discover)
     _auto_discover()
 
+    def primary_action():
+        """Finalize gating (a host's keyboard shortcut), if a panel is up."""
+        for child in panel_container.winfo_children():
+            button = getattr(child, '_done_btn', None)
+            if button is not None and str(button['state']) != tk.DISABLED:
+                button.invoke()
+                return
+
+    page.primary_action = primary_action
     return page
 
 

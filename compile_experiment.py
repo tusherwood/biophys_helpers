@@ -147,6 +147,8 @@ import argparse
 import json
 import re
 import sys
+import queue
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -1616,7 +1618,8 @@ class CompileAnnotationWindow(ttk.Frame):
         # Writing the workbook (and possibly a VQ-VAE cache) can take a
         # noticeable moment; disable Done immediately so a second click
         # can't restart it, and force that to actually paint before
-        # on_result blocks this thread doing the write.
+        # on_result runs the write (blocking this thread when standalone; in
+        # a worker thread when embedded — see build_embedded_page).
         self._done_btn.config(state=tk.DISABLED)
         self.update_idletasks()
 
@@ -1835,9 +1838,17 @@ def _write_output(superdir: Path, sample_records: list,
                   checkbox_cols: set | None = None,
                   ordered_samples: list | None = None,
                   save_vqvae: bool = True,
-                  column_sources: dict | None = None) -> Path:
+                  column_sources: dict | None = None,
+                  progress=None) -> Path:
     """`column_sources`: {annotation column: sample-name parser rule} for
-    the columns auto-detected from sample names, listed in the README."""
+    the columns auto-detected from sample names, listed in the README.
+    `progress(fraction, text)`, if given, is called as the write advances
+    (0..1) — the embedded GUI runs this in a worker thread with a progress
+    bar; it must not touch Tk itself."""
+    def report(fraction, text):
+        if progress is not None:
+            progress(fraction, text)
+
     pairing       = pairing       or {}
     annotations   = annotations   or {}
     custom_cols   = custom_cols   or []
@@ -1849,6 +1860,7 @@ def _write_output(superdir: Path, sample_records: list,
         sample_records = sorted(
             sample_records, key=lambda r: order.get(r['name'], len(order)))
 
+    report(0.0, 'Checking the crop caches')
     # Planned before the workbook so has_vqvae and the README can describe the
     # crop caches accurately. The .pt and .parquet themselves are written last,
     # since they are by far the largest and slowest part of the output.
@@ -1917,12 +1929,20 @@ def _write_output(superdir: Path, sample_records: list,
 
     _EXCEL_MAX_ROWS = 1_048_576   # incl. the header row
 
+    # Rough split of the work for the progress bar: the workbook is most of
+    # it unless a crop cache follows.
+    has_cache = save_vqvae and vqvae_plan is not None
+    wb_end = 0.45 if has_cache else 0.95
+
     with pd.ExcelWriter(str(xlsx_path), engine='openpyxl') as xw:
         meta_df.to_excel(xw, sheet_name='metadata', index=False)
 
-        for rec in sample_records:
+        n_recs = max(len(sample_records), 1)
+        for i_rec, rec in enumerate(sample_records):
             name   = rec['name']
             sheet  = sheet_names[name]
+            report(0.02 + (wb_end - 0.07) * i_rec / n_recs,
+                   f'Writing the workbook: sample {i_rec + 1}/{len(sample_records)} ({name})')
 
             # Build the blocks this sample has, in VOLUME | MASS | PAIRED order.
             blocks = []
@@ -1961,8 +1981,10 @@ def _write_output(superdir: Path, sample_records: list,
                   + '; '.join(f'meta_{c} <- {s}' for c, s in sources.items()))],
                 columns=readme_df.columns)], ignore_index=True)
         readme_df.to_excel(xw, sheet_name='README', index=False)
+        report(wb_end - 0.05, 'Saving the workbook')
 
     print(f"\nCompiled {len(sample_records)} sample(s) -> {xlsx_path}")
+    report(wb_end, 'Workbook written')
 
     if not save_vqvae:
         if any(r.get('vqvae_src') for r in sample_records):
@@ -1973,13 +1995,17 @@ def _write_output(superdir: Path, sample_records: list,
         # tensors run in the same sample order as the metadata sheet.
         print(f"\nWriting concatenated VQ-VAE crop cache "
               f"({vqvae_plan.total_rows:,} rows) -> {out_dir.name}/")
-        result = cvc.run_concat(vqvae_plan, out_dir, log=lambda m: print(f"  {m}"))
+        result = cvc.run_concat(
+            vqvae_plan, out_dir, log=lambda m: print(f"  {m}"),
+            progress=lambda f, text: report(wb_end + (0.99 - wb_end) * f,
+                                            f'{text} ({vqvae_plan.total_rows:,} crops)'))
         cvc.summarize(vqvae_plan, result,
                       len(vqvae_plan.usable) + len(vqvae_plan.skipped))
         if result.problems:
             print("  [warn] the crop cache failed its own consistency check "
                   "(see above); the workbook is unaffected.")
 
+    report(1.0, 'Done')
     return out_dir
 
 
@@ -2040,7 +2066,9 @@ def build_embedded_page(parent: tk.Widget, *,
                         initial_superdir: str | None = None,
                         on_done=None,
                         auto_detect_names: bool = False,
-                        records_provider=None) -> ttk.Frame:
+                        records_provider=None,
+                        on_busy=None,
+                        on_compiled=None) -> ttk.Frame:
     """
     Build this tool's discover-and-compile UI as a Frame suitable for
     embedding in a larger application, e.g. a wizard page.
@@ -2062,6 +2090,17 @@ def build_embedded_page(parent: tk.Widget, *,
     `records_provider(superdir) -> records`, if given, replaces the call to
     compile_experiment() — the wizard passes its sample_qc.RecordsCache so
     samples already loaded for QC aren't loaded again.
+
+    Done writes the workbook (and crop cache) in a worker thread, with a
+    progress bar and the current step under the directory fields, so the
+    window stays responsive; Done and Discover are disabled meanwhile.
+    `on_busy(bool)` is called when that write starts / ends (e.g. a wizard
+    locks its navigation), and `on_compiled(info)` after a successful write,
+    before `on_done`, with a dict: out_dir, n_samples, custom_cols,
+    column_sources, checkbox_cols, coulter_pairs, completed.
+
+    The returned frame has `primary_action()` (Discover, or Done once the
+    annotation table is open) and `is_busy()` for a host's shortcuts.
     """
     page = ttk.Frame(parent)
 
@@ -2111,10 +2150,26 @@ def build_embedded_page(parent: tk.Widget, *,
         status_label.configure(foreground=_STATUS_COLORS[kind])
         status_var.set(text)
 
+    progress_bar = ttk.Progressbar(page, mode='determinate', maximum=1.0)
+    busy = {'value': False}
+
     panel_container = ttk.Frame(page)
     panel_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
 
+    def _set_busy(value: bool):
+        busy['value'] = value
+        discover_btn.state(['disabled'] if value else ['!disabled'])
+        if value:
+            progress_bar['value'] = 0.0
+            progress_bar.pack(fill=tk.X, padx=8, pady=(2, 0), before=panel_container)
+        else:
+            progress_bar.pack_forget()
+        if on_busy is not None:
+            on_busy(value)
+
     def _discover():
+        if busy['value']:
+            return
         for child in panel_container.winfo_children():
             child.destroy()
         status_var.set('')
@@ -2149,20 +2204,69 @@ def build_embedded_page(parent: tk.Widget, *,
                      checkbox_cols, ordered_samples):
             note = ('Closed without Done — compiling without annotations or '
                     'Coulter associations. ' if not completed else '')
-            # Writing the workbook (and possibly a VQ-VAE cache) can take a
-            # noticeable moment; show that immediately and force it to
-            # actually paint, since the write below blocks this same thread.
-            _set_status(f'{note}Compiling — writing workbook, please wait…',
-                       kind='progress')
-            page.update_idletasks()
+            column_sources = dict(aw.column_sources)
+            _set_status(f'{note}Compiling…', kind='progress')
+            _set_busy(True)
 
-            out_dir = _write_output(superdir, records, pairing,
-                                    annotations, custom_cols, checkbox_cols,
-                                    ordered_samples, save_vqvae,
-                                    column_sources=aw.column_sources)
-            _set_status(f'Compiled -> {out_dir}', kind='done')
-            if on_done is not None:
-                on_done()
+            # The write runs in a worker thread (it can take minutes with a
+            # crop cache); it reports through this queue, drained on Tk's
+            # thread, and never touches a widget itself.
+            msgs: queue.Queue = queue.Queue()
+
+            def work():
+                try:
+                    out = _write_output(
+                        superdir, records, pairing, annotations, custom_cols,
+                        checkbox_cols, ordered_samples, save_vqvae,
+                        column_sources=column_sources,
+                        progress=lambda f, text: msgs.put(('progress', f, text)))
+                    msgs.put(('done', out))
+                except Exception as exc:   # reported in the page, not just a traceback
+                    import traceback
+                    traceback.print_exc()
+                    msgs.put(('error', f'{type(exc).__name__}: {exc}'))
+
+            def poll():
+                finished = None
+                while True:
+                    try:
+                        msg = msgs.get_nowait()
+                    except queue.Empty:
+                        break
+                    if msg[0] == 'progress':
+                        progress_bar['value'] = msg[1]
+                        _set_status(f'{note}Compiling — {msg[2]}…', kind='progress')
+                    else:
+                        finished = msg
+                if finished is None:
+                    page.after(100, poll)
+                    return
+                _set_busy(False)
+                if finished[0] == 'error':
+                    _set_status(f'Compile failed: {finished[1]} — fix the problem and click '
+                                f'Done again.', kind='error')
+                    if aw.winfo_exists():
+                        aw._done_btn.config(state=tk.NORMAL)
+                    return
+                out_dir = finished[1]
+                _set_status(f'Compiled -> {out_dir}', kind='done')
+                if on_compiled is not None:
+                    try:
+                        on_compiled({
+                            'out_dir': out_dir, 'n_samples': len(records),
+                            'custom_cols': list(custom_cols),
+                            'column_sources': {c: v for c, v in column_sources.items()
+                                               if c in custom_cols},
+                            'checkbox_cols': sorted(checkbox_cols),
+                            'coulter_pairs': sum(1 for v in pairing.values() if v),
+                            'completed': completed})
+                    except Exception as exc:
+                        print(f'  [warn] on_compiled failed: {exc}')
+                if on_done is not None:
+                    on_done()
+
+            threading.Thread(target=work, daemon=True).start()
+            page.after(100, poll)
 
         volume_names = {r['name'] for r in records if r['has_volume']}
         state_path, seed_xlsx = _annotation_sources(superdir)
@@ -2173,9 +2277,23 @@ def build_embedded_page(parent: tk.Widget, *,
             state_path=state_path, seed_xlsx=seed_xlsx)
         aw.pack(fill=tk.BOTH, expand=True)
 
-    ttk.Button(top, text='Discover Samples', command=_discover).grid(
-        row=2, column=1, sticky='w', pady=(8, 0))
+    discover_btn = ttk.Button(top, text='Discover Samples', command=_discover)
+    discover_btn.grid(row=2, column=1, sticky='w', pady=(8, 0))
 
+    def primary_action():
+        """Discover, or Done when an annotation table is open."""
+        if busy['value']:
+            return
+        windows = [w for w in panel_container.winfo_children()
+                   if isinstance(w, CompileAnnotationWindow)]
+        if windows:
+            if str(windows[0]._done_btn['state']) != tk.DISABLED:
+                windows[0]._finish()
+        else:
+            _discover()
+
+    page.primary_action = primary_action
+    page.is_busy = lambda: busy['value']
     return page
 
 

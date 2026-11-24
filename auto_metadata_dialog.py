@@ -10,6 +10,11 @@ column…"), or ignored. Those three actions can be remembered in
 ~/.biophys_helpers/sample_name_rules.json so later experiments detect them
 automatically; "Rules…" edits that file directly.
 
+Without an `on_apply` (review_only — the analysis wizard's up-front name
+check) there is no table to fill: the dialog only reviews the parse and
+edits the saved rules (always remembered), and `on_close()` is called when
+it closes.
+
 Apply hands the included columns to `on_apply(columns, overwrite)`:
     columns    [{'name', 'kind' ('text' | 'checkbox'), 'source',
                  'values': {sample: str}}]
@@ -31,15 +36,19 @@ _RESERVED = {'sample', 'coulter_col'}
 
 class AutoMetadataDialog(tk.Toplevel):
 
-    def __init__(self, parent: tk.Widget, samples: list, *, existing_columns: dict,
-                 on_apply):
-        """`existing_columns`: {name: 'text' | 'checkbox'} already in the table."""
+    def __init__(self, parent: tk.Widget, samples: list, *, existing_columns: dict | None = None,
+                 on_apply=None, on_close=None):
+        """`existing_columns`: {name: 'text' | 'checkbox'} already in the table.
+        No `on_apply`: review-only (see the module docstring)."""
         super().__init__(parent)
-        self.title('Auto-detect metadata from sample names')
+        self._review_only = on_apply is None
+        self._on_close = on_close
+        self.title('Sample names — what auto-detect will find' if self._review_only
+                   else 'Auto-detect metadata from sample names')
         self.transient(parent.winfo_toplevel())
         self.minsize(900, 560)
         self._samples = list(samples)
-        self._existing = dict(existing_columns)
+        self._existing = dict(existing_columns or {})
         self._on_apply = on_apply
         self._rules = snp.load_rules()
         self._col_state: dict = {}     # proposed name -> {'include','name','kind'} vars
@@ -49,6 +58,12 @@ class AutoMetadataDialog(tk.Toplevel):
         self._reparse()
         self.protocol('WM_DELETE_WINDOW', self.destroy)
         self.bind('<Escape>', lambda _e: self.destroy())
+
+    def destroy(self):
+        callback, self._on_close = self._on_close, None
+        super().destroy()
+        if callback is not None:
+            callback()
 
     # -- layout ---------------------------------------------------------------
 
@@ -104,12 +119,24 @@ class AutoMetadataDialog(tk.Toplevel):
                           ('Ignore', self._ignore_tokens)):
             ttk.Button(right, text=text, command=cmd).pack(fill=tk.X, padx=(8, 0), pady=1)
         self._remember = tk.BooleanVar(master=self, value=True)
-        ttk.Checkbutton(right, text='Remember for future experiments',
-                        variable=self._remember).pack(anchor='w', padx=(8, 0), pady=(4, 0))
+        if self._review_only:
+            # Nothing to apply to: rule edits only matter if they're saved.
+            ttk.Label(right, text='Changes are saved to your rules for every experiment.',
+                      foreground='#555', wraplength=200, justify='left').pack(
+                anchor='w', padx=(8, 0), pady=(4, 0))
+        else:
+            ttk.Checkbutton(right, text='Remember for future experiments',
+                            variable=self._remember).pack(anchor='w', padx=(8, 0), pady=(4, 0))
 
         bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, padx=10, pady=(4, 10))
         self._overwrite = tk.BooleanVar(master=self, value=False)
+        if self._review_only:
+            ttk.Label(bottom, text='The columns are filled in at the compile step '
+                                   '("Auto-detect from names").', foreground='#555').pack(
+                side=tk.LEFT)
+            ttk.Button(bottom, text='Close', command=self.destroy).pack(side=tk.RIGHT)
+            return
         ttk.Checkbutton(bottom, text='Overwrite non-empty cells of existing columns with the '
                                      'same name', variable=self._overwrite).pack(side=tk.LEFT)
         ttk.Button(bottom, text='Cancel', command=self.destroy).pack(side=tk.RIGHT)
@@ -275,7 +302,8 @@ class AutoMetadataDialog(tk.Toplevel):
                    for col, name, kind in included]
         overwrite = self._overwrite.get()
         self.destroy()
-        self._on_apply(columns, overwrite)
+        if self._on_apply is not None:
+            self._on_apply(columns, overwrite)
 
 
 def _display(value: str, kind: str) -> str:

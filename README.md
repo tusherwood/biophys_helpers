@@ -70,7 +70,11 @@ python -m unittest discover -s tests
 **Per-user settings** (not in the repo):
 - `~/.biophys_helpers/sample_name_rules.json` — the sample-name parsing rules used by
   `compile_experiment.py`'s *Auto-detect from names* (created when you first save a rule).
-- `~/.biophys_helpers/wizard_state.json` — the analysis wizard's last experiment directory.
+- `~/.biophys_helpers/wizard_state.json` — the analysis wizard's remembered settings
+  ([`user_state.py`](user_state.py)): last and recent experiment directories, window
+  size / position / maximized, sidebar widths, the per-sample reference-frequency box,
+  the last calibration JSON used for baseline density, and the notification sound.
+  Delete it to reset them.
 - `SMRFXM_PYTHON` / `SMRFXM_REPO` environment variables — where the analysis wizard finds
   the `paella_analysis` Python and the SMRFXMAnalysis checkout (defaults: the
   `paella_analysis` conda env beside this one, and `../SMRFXMAnalysis`).
@@ -139,26 +143,39 @@ reimplementing them. Each of those scripts still works standalone exactly as
 documented below — the wizard just calls a `build_embedded_page(...)` function each
 one exposes for this purpose.
 
-A **step sidebar** on the left lists every step with its status read from disk
-(✓ done, ◐ partial, ! stale, ○ not started) and jumps to any step on click;
-**Previous / Next** walk them in order. The experiment directory is shared by every
-page (typing in one updates the others live) and remembered between sessions in
-`~/.biophys_helpers/wizard_state.json`.
+A **step sidebar** on the left (drag its edge to resize) lists every step with its
+status read from disk (✓ done, ◐ partial, ! stale, ○ not started) and jumps to any
+step on click; **Previous / Next** walk them in order. The experiment directory is
+shared by every page (typing in one updates the others live) and remembered between
+sessions, along with the window layout (see *Remembered settings* below).
 
 1. **Overview** — the experiment directory (starts at the last one used; type, paste
-   or **Browse** to change it) and a checklist of where the experiment is, read from
+   or **Browse** to change it, or pick it from **Recent ▾** — the last 10 — or
+   **Newest in raw_data**, the latest date-named folder in `D:\raw_data`, calibration
+   folders excluded) and a checklist of where the experiment is, read from
    disk by [`experiment_status.py`](experiment_status.py): buoyant mass (the MATLAB
    SMR analysis, run outside the wizard), baseline density & categories, imaging per
    category, gating, compile (flagged *stale* when gate files, the samples' newest
    imaging HDF5s or the saved annotations changed after it), and the new analysis
    dir, each with an **Open** button. **Continue where I left off** jumps to the
-   first unfinished step after the furthest finished one.
+   first unfinished step after the furthest finished one (**Go to the summary**
+   once everything is done); **Open analysis log** opens the experiment's log.
+   A **Sample names** check runs the auto-detect rules over the sample folder names
+   up front: it lists tokens no rule recognises and **possible typos** (a rare token
+   spelled almost like a known word, e.g. `prolfi` ≈ `prolif`, or two values of one
+   column spelled almost alike, e.g. drug `wnk436` / `wnk463` — numbers that merely
+   differ, like `150mM` / `180mM`, are not flagged), so a misnamed folder can be fixed
+   before it is analysed. **Review names…** opens the auto-detect dialog to turn
+   tokens into columns or ignore them (saved to your rules). Information only — it
+   never blocks Next.
 2. **Baseline density & categories** — `calculate_baseline_density.py`'s GUI with
    its **density categories** (see that section): group the samples to be
    imaging-analysed at one shared media density, with **Skip** for samples not to
    analyse. A directory's last saved result (`*_baseline_density.csv`) and its
-   categories are shown straight away, without re-running. Next needs every sample
-   in a category.
+   categories are shown straight away, without re-running. The calibration JSON is
+   filled in automatically (the experiment folder's own, else the last one used —
+   see that section); Browse or typing always wins. Next needs every sample in a
+   category.
 3. **Imaging analysis by category** — one card per category (samples, their
    densities and reference frequencies, the mean, on-disk analysis status) with a
    **Copy for batch window** button. SMRFXMAnalysis' Bulk Run Queue window opens
@@ -172,7 +189,12 @@ page (typing in one updates the others live) and remembered between sessions in
    category's density (4 decimals; BF-only systems need only the image stage,
    samples with no image binaries have nothing to analyse), *Needs rerun* when a
    sample ran at a different density. Next needs every category analysed; a sample
-   that can't be analysed can be moved to Skip in step 2.
+   that can't be analysed can be moved to Skip in step 2. **Notifications:** when a
+   check finds a category newly analysed ("✓ Sucrose analysed — 2 categories left",
+   or "all categories done — Next is unlocked"), or the batch window closes (with
+   **Show log** if it exited with an error), a message bar appears at the top of the
+   page, the Windows notification sound plays (untick **Sound** to mute; remembered)
+   and the wizard's taskbar button flashes if it isn't in front.
 4. **Gating: Buoyant Mass + Volume** — `gate_experiments_inplace.py` in combined
    mode: mass, normalized baseline, baseline slope, average node deviation and iFXM
    volume, all gated per-sample together (see below). Auto-discovers as soon as the
@@ -192,11 +214,43 @@ page (typing in one updates the others live) and remembered between sessions in
    saved as you edit (`<experiment>/compile_annotations.json`) and restored on the
    next Discover, so re-compiling after re-gating doesn't mean re-annotating; with
    no saved file it is seeded from the previous compile's metadata sheet. A table
-   that starts empty opens **Auto-detect from names**. Clicking Done advances.
+   that starts empty opens **Auto-detect from names**. Done writes the workbook and
+   crop cache in the background with a progress bar and the current step (sample
+   *n*/*N*, crop cache); the wizard's navigation is locked until it finishes (closing
+   the window asks first), an error is shown on the page with Done re-enabled, and a
+   successful compile advances.
 7. **New analysis dir** — `new_analysis_dir.py`'s GUI, using the shared directory as
    its raw data dir (no list picker): **Create** scaffolds the code and
    data_analysis dirs named after it, then offers to copy in its `*_compiled` and
-   `*_gating_summary` dirs. Its Close button closes the wizard.
+   `*_gating_summary` dirs. A finished copy also copies the analysis log into
+   `<data_analysis>/<name>/` and moves on to the summary; Close closes the wizard.
+8. **Summary** — what was produced, each with an **Open** button: the experiment, the
+   newest compiled folder, its workbook (size), its crop cache (size and crop count),
+   the analysis and code folders, and the analysis log. A ready-to-paste prompt for
+   the biophys-plotting plugin (`Plot my experiment: <…>\data\experiment_data.xlsx`)
+   with **Copy**, the final checklist, and any Sample QC flags still standing.
+
+**Analysis log.** The wizard appends its checkpoints to
+`<experiment>/analysis_log.md` ([`analysis_log.py`](analysis_log.py)), a plain
+Markdown file with one section per session: baseline density runs (calibration file
+and where it came from, reference-frequency mode, the CSV written), the density
+categories whenever you leave step 2 with changes (names, mean densities, members),
+each category's imaging as the wizard sees it complete, gating finalized (or the
+existing gate files kept), each compile (output folder, annotation columns and which
+were auto-detected) with the Sample QC flags at that moment, the new analysis dir,
+and the copy. Only checkpoints are logged, not individual edits.
+
+**Keyboard shortcuts.** **Alt+→ / Alt+←** Next / Previous; **Ctrl+1…8** jump to a
+step; **Ctrl+Enter** the step's main action (Overview: Continue; baseline: Run;
+imaging: Refresh status; gating: Finalize gating; QC: Recompute; compile: Discover,
+or Done once the table is open; new analysis dir: Create, then Copy; summary: copy
+the plotting prompt); **F5** refresh status. All but Ctrl+Enter are ignored while
+typing in a text field. They are listed in the bottom bar and in tooltips.
+
+**Remembered settings** (`~/.biophys_helpers/wizard_state.json`): the last and
+recent experiments, the window's size, position and maximized state (a position
+that is no longer on any monitor is dropped), both sidebar widths, the per-sample
+reference-frequency box, the last calibration JSON and the notification sound.
 
 The batch window is found at the `paella_analysis` conda env beside this one
 and an `SMRFXMAnalysis` checkout beside this repo (whatever branch it has
@@ -477,6 +531,15 @@ clipboard for SMRFXMAnalysis' Bulk Run Queue (**Paste category** there). The
 categories are saved to `<superdir>/density_categories.json` on every change
 (name, colour, samples, mean) and restored when that superdir is computed again.
 This replaces the old *Mark Selected Red* row marking.
+
+**Calibration JSON (GUI).** While the field is empty (or still holds an automatic
+pick), it fills itself whenever the superdir changes: with the newest
+`<YYYYMMDD>_density_baseline_calibration.json` directly in the superdir, else with
+the calibration of the last successful run (remembered in
+`~/.biophys_helpers/wizard_state.json`). A grey note under the field says which.
+A path you type or Browse is never replaced; clear the field to go back to the
+automatic pick. The per-sample box and the category sidebar's width are
+remembered too.
 
 **Output** (written inside `<superdir>`, at the same level as the sample subdirs)
 
@@ -1391,7 +1454,10 @@ These are imported by the scripts above and are not run directly.
 | [`density_categories.py`](density_categories.py) | Density categories for `calculate_baseline_density.py` and the analysis wizard: the category model (saved as `<superdir>/density_categories.json`), the category sidebar and review page, the clipboard payload SMRFXMAnalysis' batch window takes via *Paste category*, the on-disk analysis-status check (h5py), and the launcher for that batch window. |
 | [`experiment_status.py`](experiment_status.py) | Where an experiment is in the pipeline, read from disk (mass, baseline & categories, imaging per category, gating, compile incl. staleness, new analysis dir) — the analysis wizard's Overview and step sidebar. |
 | [`sample_qc.py`](sample_qc.py) | The wizard's per-sample QC table and flags, and `RecordsCache`, which keeps `compile_experiment()`'s loaded samples while nothing on disk changes. |
-| [`sample_name_parser.py`](sample_name_parser.py) | GUI-free parser that proposes per-sample metadata from sample directory names (time, drug/dose, osmolarity, flags, word lists, replicate), with the user rules file `~/.biophys_helpers/sample_name_rules.json`. |
-| [`auto_metadata_dialog.py`](auto_metadata_dialog.py) | `compile_experiment.py`'s *Auto-detect from names* review dialog (and its rules editor), built on `sample_name_parser.py`. |
+| [`sample_name_parser.py`](sample_name_parser.py) | GUI-free parser that proposes per-sample metadata from sample directory names (time, drug/dose, osmolarity, flags, word lists, replicate), with the user rules file `~/.biophys_helpers/sample_name_rules.json`; `check_names()` is the wizard's up-front name check (unrecognised tokens, likely typos). |
+| [`auto_metadata_dialog.py`](auto_metadata_dialog.py) | `compile_experiment.py`'s *Auto-detect from names* review dialog (and its rules editor), built on `sample_name_parser.py`; also opened review-only from the wizard's Overview. |
+| [`analysis_log.py`](analysis_log.py) | Appends the wizard's checkpoints to `<experiment>/analysis_log.md`. |
+| [`user_state.py`](user_state.py) | The per-user settings file `~/.biophys_helpers/wizard_state.json` (recent experiments, window layout, last calibration, …). |
+| [`desktop_notify.py`](desktop_notify.py) | Stdlib-only notification sound, taskbar flash and on-screen check for the Tk GUIs (Windows; no-ops elsewhere). |
 | [`pipeline/stage2/pairing_utils.py`](pipeline/stage2/pairing_utils.py) | Cross-correlation pairing primitives (SciPy-based signal building, lag estimation, peak matching) used only by the [deprecated](#deprecated) pairing scripts. |
 | [`fsutil.py`](fsutil.py) | Stdlib-only filesystem helpers shared across scripts. `is_appledouble()` detects macOS AppleDouble sidecars (`._*`) so scans of exFAT/FAT external drives skip them. |

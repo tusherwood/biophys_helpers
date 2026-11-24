@@ -244,6 +244,7 @@ class QCPage(ttk.Frame):
         self._superdir = superdir_var
         self._cache = cache
         self._rows: list = []
+        self._loaded = False
         self._sort = ('flags', False)
         self._job = None
 
@@ -279,6 +280,11 @@ class QCPage(ttk.Frame):
         self._tree.tag_configure('flagged', background='#fde2e2')
         self._tree.tag_configure('ok', background='#ffffff')
 
+    def loaded_rows(self) -> list | None:
+        """The QC rows of the last completed load (None while none has
+        finished, or while one is running)."""
+        return None if self._job is not None or not self._loaded else list(self._rows)
+
     def refresh(self, *, force: bool = False):
         text = self._superdir.get().strip()
         if not text or not Path(text).is_dir():
@@ -313,6 +319,7 @@ class QCPage(ttk.Frame):
             self._summary.configure(text=f'Could not load the samples — {result["error"]}')
             return
         self._rows = result.get('rows', [])
+        self._loaded = True
         n_flag = sum(1 for r in self._rows if r.flags)
         self._summary.configure(text=(
             f'{len(self._rows)} samples — '

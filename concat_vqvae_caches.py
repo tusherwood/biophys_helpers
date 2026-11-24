@@ -629,9 +629,12 @@ def _copy_blob_rows(src_path: Path, storage_key: str, dst, expect: int,
 
 
 def write_concat_pt(sources: list[CacheSource], keys: list[str],
-                    out_path: Path, prefix: str = 'archive') -> dict:
+                    out_path: Path, prefix: str = 'archive', progress=None) -> dict:
     """
     Write the concatenated .pt, streaming every source blob through.
+
+    `progress(done, total)`, if given, is called after each source blob with
+    the source bytes streamed so far and in all (e.g. a GUI's progress bar).
 
     Returns {key: shape}. Sources are consumed in list order, which is the same
     order the parquet pass uses, so tensor rows and parquet rows stay aligned.
@@ -657,6 +660,11 @@ def write_concat_pt(sources: list[CacheSource], keys: list[str],
     _Pickler(buf, protocol=2).dump(payload)
     data_pkl = buf.getvalue()
 
+    work_total = sum(s.tensors[key].numel
+                     * _STORAGE_ITEMSIZE[s.tensors[key].storage.storage_class]
+                     for _sk, key, _tb in plan for s in sources)
+    work_done = 0
+
     with zipfile.ZipFile(str(out_path), 'w', zipfile.ZIP_STORED) as zf:
         with _open_aligned(zf, f'{prefix}/data.pkl', len(data_pkl)) as dst:
             dst.write(data_pkl)
@@ -679,6 +687,9 @@ def write_concat_pt(sources: list[CacheSource], keys: list[str],
                     else:
                         _copy_blob_rows(src.pt_path, info.storage.key, dst,
                                         info.numel * itemsize, src.row_keep)
+                    work_done += info.numel * itemsize
+                    if progress is not None:
+                        progress(work_done, work_total)
     return shapes
 
 
@@ -971,22 +982,36 @@ def plan_concat(sources: list[CacheSource], requested_keys: str | None = None,
     return ConcatPlan(usable, skipped, keys, schema)
 
 
-def run_concat(plan: ConcatPlan, out_dir: Path, log=print) -> ConcatResult:
+def run_concat(plan: ConcatPlan, out_dir: Path, log=print, progress=None) -> ConcatResult:
     """
     Write the plan's .pt and .parquet into out_dir, then self-check them.
 
     The tensor pass and the parquet pass walk plan.usable in the same order,
     which is what keeps tensor row i and parquet row i describing the same crop.
+
+    `progress(fraction, text)`, if given, reports how far along the write is
+    (0..1); the .pt is most of the work.
     """
+    def report(fraction, text):
+        if progress is not None:
+            progress(fraction, text)
+
     pt_out      = out_dir / OUT_PT_NAME
     parquet_out = out_dir / OUT_PARQUET_NAME
 
     log(f'Writing {pt_out.name}...')
-    shapes = write_concat_pt(plan.usable, plan.keys, pt_out)
+    report(0.0, f'Writing {pt_out.name}')
+    shapes = write_concat_pt(
+        plan.usable, plan.keys, pt_out,
+        progress=lambda done, total: report(0.85 * done / total if total else 0.85,
+                                            f'Writing {pt_out.name}'))
     log(f'Writing {parquet_out.name}...')
+    report(0.85, f'Writing {parquet_out.name}')
     rows = write_concat_parquet(plan.usable, parquet_out, plan.schema)
 
+    report(0.95, 'Checking the crop cache')
     problems = self_check(pt_out, parquet_out, plan.keys)
+    report(1.0, 'Crop cache written')
     return ConcatResult(pt_out, parquet_out, shapes, rows, problems)
 
 
