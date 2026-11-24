@@ -11,11 +11,15 @@ and shows what it found. Nothing is copied until you click Copy.
 
 Edit the paths below to match this computer's setup.
 
-Embedding: `build_embedded_page(parent, raw_dir_var=..., on_close=...)`
-builds the same panel inside another app (analysis_wizard.py uses it as its
-final step). There the raw-data-dir list is replaced by the host's shared
-directory variable plus a "Create" button; everything from Create onward
-(discovery, Copy, progress) is identical to the standalone GUI.
+Embedding: `build_embedded_page(parent, raw_dir_var=..., on_close=...,
+on_created=..., on_copied=...)` builds the same panel inside another app
+(analysis_wizard.py uses it as its step 7, before the summary). There the
+raw-data-dir list is replaced by the host's shared directory variable plus a
+"Create" button; everything from Create onward (discovery, Copy, progress) is
+identical to the standalone GUI. The optional hooks run after Create and
+after a completed copy (the wizard logs both, copies its analysis log into
+the new data dir and moves on to its summary); primary_action() is Create,
+then Copy (the wizard's Ctrl+Enter).
 
 Usage:
     python new_analysis_dir.py [filter]

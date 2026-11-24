@@ -43,7 +43,9 @@ This installs Python 3.12 plus `numpy`, `scipy`, `pandas`, `openpyxl`, `matplotl
 > - **Pillow** (`PIL`) is required by `browse_experiment.py` for image display, and by the
 >   Images tab in `browse_pt.py`, which renders crops decoded straight from a `.pt` blob.
 > - **pyarrow** is the Parquet reader behind `browse_parquet.py`, and is also what
->   `browse_pt.py` uses to read the sibling metadata parquet next to a crop cache. Like
+>   `browse_pt.py` uses to read the sibling metadata parquet next to a crop cache,
+>   what `compile_experiment.py` / `concat_vqvae_caches.py` write the merged crop
+>   metadata with, and what the analysis wizard's Summary step counts crops from. Like
 >   `openpyxl`, pandas treats it as an optional extra, so it must be installed explicitly.
 > - **No PyTorch is needed** to inspect `.pt` files. `browse_pt.py` parses the zip
 >   archive and stubs the pickle, recovering every tensor shape, dtype and device without
@@ -56,7 +58,9 @@ This installs Python 3.12 plus `numpy`, `scipy`, `pandas`, `openpyxl`, `matplotl
 >   `browse_h5.py`, `browse_parquet.py` and `browse_pt.py` with `--dump`, which print to
 >   stdout. They are
 >   cross-platform (macOS / Windows / Linux); on macOS the tkinter theme is forced to
->   `clam` so table row colors render correctly. Scripts that scan external
+>   `clam` so table row colors render correctly. The analysis wizard's notification
+>   sound and taskbar flash ([`desktop_notify.py`](desktop_notify.py), standard library
+>   only) work on Windows; elsewhere they fall back to the Tk bell or do nothing. Scripts that scan external
 >   (exFAT/FAT) drives skip macOS AppleDouble sidecar files (`._*`) via
 >   [`fsutil.py`](fsutil.py).
 
@@ -124,6 +128,9 @@ VQ-VAE crop caches across experiments: concat_vqvae_caches.py ──> *_vqvae_co
   (compile_experiment.py does the same merge for one experiment into its *_compiled/ dir)
 
 Housekeeping: prune_timestamped_subdirs.py
+
+Provenance: the analysis wizard records each checkpoint above in <experiment>/analysis_log.md
+  (copied into the data_analysis dir with the compiled data)
 ```
 
 The standalone SMR/FXM cross-correlation pairing scripts are retired: pairing now comes
@@ -296,7 +303,11 @@ them, with a progress bar and cancel. Nothing is copied until you click Copy,
 and existing files are never overwritten.
 
 The three paths are machine-specific constants at the top of the script — edit
-them when running on a different computer.
+them when running on a different computer. The analysis wizard uses them too:
+`RAW_DATA_DIR` for **Newest in raw_data**, and the other two for its Summary step.
+
+In the wizard (step 7), a finished copy also places the experiment's
+`analysis_log.md` in `<DATA_ANALYSIS_DIR>/<name>/` and moves on to the summary.
 
 ```bash
 python new_analysis_dir.py            # pick from the list
@@ -993,6 +1004,13 @@ crops = bf[rows]          # (n, 1, S, S) uint8
 A cache whose parquet row count disagrees with its tensor `N` is excluded from the merge
 (and reported) rather than corrupting the output; the workbook is written regardless, so a
 crop-cache problem never costs you the compilation.
+
+**Writing.** Standalone, Done writes the output in the foreground and the window closes
+when it's finished (progress goes to the console). Embedded in the
+[analysis wizard](#analysis-wizard), Done writes in a background thread with a progress
+bar and the current step (sample *n*/*N*, then the crop cache), so the window stays
+responsive. A failed write is reported on the page with Done re-enabled. The output is
+identical either way.
 
 **Usage**
 
