@@ -28,6 +28,12 @@ Workflow:
        "% retained" readout, and the bottom bar shows the pooled mass AND
        retained %. "Apply cutoffs" commits the group (confirming first if zero
        attributes are gated) and returns the panel to an idle preview.
+       Baseline slope and average node deviation start with an auto gate at
+       the 1st-99th percentile of the selection's pooled cells (one tight
+       peak plus rare extreme outliers) and a default view zoomed onto the
+       central peak (a cutoff outside the view is marked at the plot edge);
+       click to replace it, "Clear gate" to drop it, "Full range" to see
+       every cell (AUTO_GATE_* constants below).
     4. Step 2-3 repeats until all samples are assigned. "Finalize gating"
        (highlighted) then becomes available.
     5. On "Finalize gating":
@@ -130,6 +136,28 @@ _VOLUME_ATTR = {'key': 'volume_fl', 'label': 'iFXM volume',
                 'x_pad': 0.25}
 _ALL_ATTRS = _BM_ATTRS + [_VOLUME_ATTR]
 _ATTR_LABELS[_VOLUME_ATTR['key']] = _VOLUME_ATTR['label']
+
+# Auto gates: these attributes are normally one tight peak with a few extreme
+# outliers, so selecting samples presets their gate to these percentiles of
+# the selection's pooled cells (replace it by clicking, or Clear gate).
+AUTO_GATE_KEYS = ('bl_slope', 'node_dev_mean')
+AUTO_GATE_PERCENTILES = (1.0, 99.0)
+# Their default x view: the central peak, i.e. these percentiles widened by
+# AUTO_VIEW_PAD of their width on each side. The tails are heavy (the 1-99
+# range is often ~100x the interquartile range), so the auto-gate lines
+# usually fall outside it and are marked at the plot edge; "Full range" shows
+# every cell.
+AUTO_VIEW_PERCENTILES = (5.0, 95.0)
+AUTO_VIEW_PAD = 0.5
+AUTO_GATE_NOTE = (f'auto p{AUTO_GATE_PERCENTILES[0]:g}-p{AUTO_GATE_PERCENTILES[1]:g}')
+
+
+def _auto_range(pooled: np.ndarray) -> tuple | None:
+    """(lower, upper) percentiles of `pooled`, or None if they don't make a range."""
+    if pooled.size < 2:
+        return None
+    lo, hi = (float(x) for x in np.percentile(pooled, AUTO_GATE_PERCENTILES))
+    return (lo, hi) if hi > lo else None
 
 
 def _attr_values(df: pd.DataFrame, attr: dict) -> np.ndarray:
@@ -450,7 +478,7 @@ def _save_group_histograms(hist_dir: Path, mass_data: dict, volume_data: dict,
             pooled = np.concatenate([v for _, v in arrays])
             lo, hi = float(pooled.min()), float(pooled.max())
             if key in ranges:
-                _glo, _ghi, view = ranges[key]
+                _glo, _ghi, view, _how = ranges[key]
                 if view is not None:
                     lo, hi = view
             if hi <= lo:
@@ -461,7 +489,7 @@ def _save_group_histograms(hist_dir: Path, mass_data: dict, volume_data: dict,
                 ax.hist(v, bins=edges, alpha=0.5, edgecolor='black',
                         linewidth=0.3, label=name)
             if key in ranges:
-                glo, ghi, _view = ranges[key]
+                glo, ghi, _view, _how = ranges[key]
                 ax.axvline(glo, color='red', linestyle='--', linewidth=1.2,
                           label=f'lower = {glo:.4g}')
                 ax.axvline(ghi, color='steelblue', linestyle='--', linewidth=1.2,
@@ -515,8 +543,8 @@ def _write_cutoff_log(log_path: Path, superdir: Path, mass_data: dict,
     for i, (ranges, names) in enumerate(groups, 1):
         if ranges:
             range_desc = '; '.join(
-                f"{_ATTR_LABELS[k]}: {lo:.4g} - {hi:.4g}"
-                for k, (lo, hi, _v) in ranges.items())
+                f"{_ATTR_LABELS[k]}: {lo:.4g} - {hi:.4g}" + (f" ({how})" if how else '')
+                for k, (lo, hi, _v, how) in ranges.items())
         else:
             range_desc = '(no gates set — all points accepted)'
         lines.append(f"Group {i}   {range_desc}")
@@ -584,7 +612,8 @@ def _write_output(superdir: Path, sample_dirs: dict, mass_data: dict,
     Writes every sample's gate file plus one summary folder.
 
     `cutoffs` maps sample -> {attr_key: (lower, upper)} and `groups` is an
-    ordered list of ({attr_key: (lower, upper, view)}, [sample, ...]), with
+    ordered list of ({attr_key: (lower, upper, view, how)}, [sample, ...])
+    (`how` is '' for a clicked gate, AUTO_GATE_NOTE for an auto one), with
     'volume_fl' as just another attribute key. Each sample's gate file only
     gets the attributes it has data for (see _relevant_gates).
     """
@@ -650,7 +679,15 @@ class MultiAttributeGatingPanel(tk.Frame):
         on_finish:     callable(cutoffs, groups) -> Path | str | None, called
                        on Finalize gating; cutoffs maps sample ->
                        {attr_key: (lower, upper)}, groups is an ordered list
-                       of ({attr_key: (lower, upper, view)}, [sample, ...]).
+                       of ({attr_key: (lower, upper, view, how)}, [sample, ...]).
+
+    Auto gates: for AUTO_GATE_KEYS (baseline slope, node deviation),
+    selecting samples presets the gate to AUTO_GATE_PERCENTILES of the pooled
+    selection and zooms the default view onto the central peak
+    (AUTO_VIEW_PERCENTILES / AUTO_VIEW_PAD; off-view cutoffs are marked at
+    the plot edge); clicking the
+    plot replaces the auto gate, Clear gate removes it, "Full range" shows
+    every cell.
         context_label: text appended to the header, e.g. the superdir name
         on_done:       optional callable() invoked after the Finalize dialog
                        is dismissed (e.g. root.destroy standalone; a wizard
@@ -789,6 +826,9 @@ class MultiAttributeGatingPanel(tk.Frame):
                  command=lambda k=key: self._apply_attr_xlim(k)).pack(side=tk.LEFT)
         tk.Button(view_row, text='Reset view',
                  command=lambda k=key: self._reset_attr_xlim(k)).pack(side=tk.LEFT, padx=(4, 0))
+        if key in AUTO_GATE_KEYS:
+            tk.Button(view_row, text='Full range',
+                     command=lambda k=key: self._full_attr_xlim(k)).pack(side=tk.LEFT, padx=(4, 0))
         tk.Button(view_row, text='Clear gate',
                  command=lambda k=key: self._reset_attr_gate(k)).pack(side=tk.RIGHT)
 
@@ -804,8 +844,8 @@ class MultiAttributeGatingPanel(tk.Frame):
             'frame': cell, 'fig': fig, 'ax': ax, 'canvas': canvas,
             'xmin_var': xmin_var, 'xmax_var': xmax_var,
             'status_var': status_var, 'retained_var': retained_var,
-            'lower': None, 'upper': None, 'state': 0,
-            'view': None, 'full_xlim': None,
+            'lower': None, 'upper': None, 'state': 0, 'auto': False,
+            'view': None, 'full_xlim': None, 'default_xlim': None,
         }
 
     # -- left: sample list -------------------------------------------------
@@ -852,10 +892,18 @@ class MultiAttributeGatingPanel(tk.Frame):
             st['lower'] = None
             st['upper'] = None
             st['state'] = 0
+            st['auto'] = False
             st['view'] = None
             st['xmin_var'].set('')
             st['xmax_var'].set('')
             st['status_var'].set('Click to set a cutoff.')
+            if key in AUTO_GATE_KEYS:
+                rng = _auto_range(self._pooled(key))
+                if rng is not None:
+                    st['lower'], st['upper'] = rng
+                    st['state'] = 2
+                    st['auto'] = True
+                    st['status_var'].set(self._auto_status())
             self._draw_attr_histograms(key)
             self._update_attr_retained(key)
         self._apply_btn.config(state=tk.NORMAL)
@@ -868,6 +916,7 @@ class MultiAttributeGatingPanel(tk.Frame):
             st['lower'] = None
             st['upper'] = None
             st['state'] = 0
+            st['auto'] = False
             st['view'] = None
             st['status_var'].set('')
             self._draw_idle_attr(key)
@@ -891,9 +940,17 @@ class MultiAttributeGatingPanel(tk.Frame):
         self._history.append((
             self._cutoffs.copy(), list(self._groups), list(self._remaining)))
 
-        ranges = {k: (self._attr[k]['lower'], self._attr[k]['upper'], self._attr[k]['view'])
-                 for k in set_keys}
-        flat_ranges = {k: (lo, hi) for k, (lo, hi, _v) in ranges.items()}
+        def view_of(k):
+            st = self._attr[k]
+            # an auto-gated attribute's summary plot uses its zoomed default view
+            if st['view'] is None and k in AUTO_GATE_KEYS:
+                return st['default_xlim']
+            return st['view']
+
+        ranges = {k: (self._attr[k]['lower'], self._attr[k]['upper'], view_of(k),
+                      AUTO_GATE_NOTE if self._attr[k]['auto'] else '')
+                  for k in set_keys}
+        flat_ranges = {k: r[:2] for k, r in ranges.items()}
         for name in self._active_selection:
             self._cutoffs[name] = dict(flat_ranges)
             self._remaining.remove(name)
@@ -908,6 +965,30 @@ class MultiAttributeGatingPanel(tk.Frame):
         """One sample's values for one attribute, or None if that sample has
         no data of this attribute's kind (mass table vs. volume)."""
         return _sample_values(name, spec, self._data, self._volume_data)
+
+    def _selection_arrays(self, key: str) -> list:
+        """[(sample, finite values)] for the active selection (positive only on a
+        log axis), skipping samples without data for this attribute."""
+        spec = self._spec[key]
+        log = spec.get('scale') == 'log'
+        arrays = []
+        for name in self._active_selection or []:
+            v = self._values(name, spec)
+            if v is None:
+                continue
+            v = v[np.isfinite(v) & (v > 0)] if log else v[np.isfinite(v)]
+            if v.size:
+                arrays.append((name, v))
+        return arrays
+
+    def _pooled(self, key: str) -> np.ndarray:
+        arrays = self._selection_arrays(key)
+        return np.concatenate([v for _, v in arrays]) if arrays else np.array([])
+
+    @staticmethod
+    def _auto_status() -> str:
+        p_lo, p_hi = AUTO_GATE_PERCENTILES
+        return f'Auto gate: percentiles {p_lo:g}–{p_hi:g} (click the plot to replace)'
 
     def _draw_idle_attr(self, key: str, text: str = 'Select samples\non the left'):
         st = self._attr[key]
@@ -933,14 +1014,7 @@ class MultiAttributeGatingPanel(tk.Frame):
         ax.clear()
 
         log = spec.get('scale') == 'log'
-        arrays = []
-        for name in self._active_selection:
-            v = self._values(name, spec)
-            if v is None:
-                continue
-            v = v[np.isfinite(v) & (v > 0)] if log else v[np.isfinite(v)]
-            if v.size:
-                arrays.append((name, v))
+        arrays = self._selection_arrays(key)
         if not arrays:
             self._draw_idle_attr(key, 'No data for\nthis selection')
             return
@@ -956,11 +1030,17 @@ class MultiAttributeGatingPanel(tk.Frame):
         else:
             pad = x_pad * (pmax - pmin)
             st['full_xlim'] = (pmin - pad, pmax + pad)
+        st['default_xlim'] = st['full_xlim']
+        if key in AUTO_GATE_KEYS and pooled.size >= 2:
+            v_lo, v_hi = (float(x) for x in np.percentile(pooled, AUTO_VIEW_PERCENTILES))
+            if v_hi > v_lo:
+                pad = AUTO_VIEW_PAD * (v_hi - v_lo)
+                st['default_xlim'] = (max(v_lo - pad, pmin), min(v_hi + pad, pmax))
         if not st['xmin_var'].get() and not st['xmax_var'].get():
-            st['xmin_var'].set(f"{st['full_xlim'][0]:.4g}")
-            st['xmax_var'].set(f"{st['full_xlim'][1]:.4g}")
+            st['xmin_var'].set(f"{st['default_xlim'][0]:.4g}")
+            st['xmax_var'].set(f"{st['default_xlim'][1]:.4g}")
 
-        lo, hi = xlim if xlim is not None else st['full_xlim']
+        lo, hi = xlim if xlim is not None else st['default_xlim']
         if hi <= lo:
             hi = lo * 2 if log else lo + 1
         # Log-spaced edges on a log axis so bars are equal width.
@@ -977,6 +1057,10 @@ class MultiAttributeGatingPanel(tk.Frame):
         ax.tick_params(labelsize=7)
         if key == self._keys[0] and len(arrays) > 1:
             ax.legend(fontsize=6, loc='upper right')
+        n_out = int(np.count_nonzero((pooled < lo) | (pooled > hi)))
+        if n_out:
+            ax.text(0.01, 0.86, f'{n_out} cell{"s" if n_out != 1 else ""}\noutside view',
+                    transform=ax.transAxes, ha='left', va='top', fontsize=7, color='#777777')
         st['fig'].tight_layout()
 
         self._draw_attr_cutoffs(key)
@@ -986,6 +1070,16 @@ class MultiAttributeGatingPanel(tk.Frame):
         st = self._attr[key]
         ax = st['ax']
         y_top = ax.get_ylim()[1]
+        x_lo, x_hi = sorted(ax.get_xlim())
+        # A cutoff outside the view gets an arrow label at that edge instead.
+        for value, color in ((st['lower'], 'red'), (st['upper'], 'steelblue')):
+            if value is None or x_lo <= value <= x_hi:
+                continue
+            left = value < x_lo
+            ax.text(0.01 if left else 0.99, 0.97,
+                    f'← {value:.3g}' if left else f'{value:.3g} →',
+                    transform=ax.transAxes, color=color, fontsize=7, va='top',
+                    ha='left' if left else 'right')
         if st['lower'] is not None:
             ax.axvline(st['lower'], color='red', linestyle='--', linewidth=1.0)
             ax.text(st['lower'], y_top, f"{st['lower']:.3g}", color='red',
@@ -1024,13 +1118,24 @@ class MultiAttributeGatingPanel(tk.Frame):
 
     def _reset_attr_xlim(self, key: str):
         st = self._attr[key]
+        if self._active_selection is None or st['default_xlim'] is None:
+            return
+        lo, hi = st['default_xlim']
+        st['xmin_var'].set(f'{lo:.4g}')
+        st['xmax_var'].set(f'{hi:.4g}')
+        st['view'] = None
+        self._draw_attr_histograms(key)
+
+    def _full_attr_xlim(self, key: str):
+        """Show every cell (the un-zoomed min-max view)."""
+        st = self._attr[key]
         if self._active_selection is None or st['full_xlim'] is None:
             return
         lo, hi = st['full_xlim']
         st['xmin_var'].set(f'{lo:.4g}')
         st['xmax_var'].set(f'{hi:.4g}')
-        st['view'] = None
-        self._draw_attr_histograms(key)
+        st['view'] = (lo, hi)
+        self._draw_attr_histograms(key, xlim=(lo, hi))
 
     def _reset_attr_gate(self, key: str):
         if self._active_selection is None:
@@ -1039,6 +1144,7 @@ class MultiAttributeGatingPanel(tk.Frame):
         st['lower'] = None
         st['upper'] = None
         st['state'] = 0
+        st['auto'] = False
         st['status_var'].set('Click to set a cutoff.')
         self._draw_attr_histograms(key, xlim=st['view'])
         self._update_attr_retained(key)
@@ -1052,6 +1158,16 @@ class MultiAttributeGatingPanel(tk.Frame):
         st = self._attr[key]
         x = event.xdata
 
+        if st['auto']:
+            # A click replaces the auto gate: it becomes the first cutoff.
+            st['lower'], st['upper'] = x, None
+            st['state'] = 1
+            st['auto'] = False
+            st['status_var'].set(f"First cutoff: {x:.4g} — click second cutoff")
+            self._draw_attr_histograms(key, xlim=st['view'])
+            self._update_attr_retained(key)
+            self._update_overall_retained()
+            return
         if st['state'] == 0:
             st['lower'] = x
             st['state'] = 1
