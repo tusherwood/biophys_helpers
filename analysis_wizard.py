@@ -1360,6 +1360,9 @@ def main():
     def _dir_copied(data_dir, jobs):
         sd = _superdir_path()
         details = [f'{Path(src).name} → {Path(dst)}' for src, dst in jobs]
+        skipped = getattr(pages.get('new_dir'), 'skipped', [])
+        if skipped:
+            details.append('left out: ' + ', '.join(Path(p).name for p in skipped))
         _log('Copied into the analysis dir', str(data_dir), details, superdir=sd)
         # The log travels with the data (copied after its own entry).
         if sd is not None and analysis_log.log_path(sd).is_file():

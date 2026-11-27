@@ -231,7 +231,9 @@ sessions, along with the window layout (see *Remembered settings* below).
 7. **New analysis dir** — `new_analysis_dir.py`'s GUI, using the shared directory as
    its raw data dir (no list picker): **Create** scaffolds the code and
    data_analysis dirs named after it, then offers to copy in its `*_compiled` and
-   `*_gating_summary` dirs. A finished copy also copies the analysis log into
+   `*_gating_summary` dirs. The compiled dir's VQ-VAE crop cache
+   (`concat_vqvae_cache.pt` + metadata parquet, often GBs) has its own checkbox, off by
+   default: unticked, the compiled dir is copied without it (noted in the analysis log). A finished copy also copies the analysis log into
    `<data_analysis>/<name>/` and moves on to the summary; Close closes the wizard.
 8. **Summary** — what was produced, each with an **Open** button: the experiment, the
    newest compiled folder, its workbook (size), its crop cache (size and crop count),
@@ -302,7 +304,9 @@ becomes the analysis name `<name>`, and it creates
 then looks in the chosen raw dir for the newest `*_compiled` (contents →
 `<name>/data/`) and `*_gating_summary` (→ `<name>/gating/`) and offers to copy
 them, with a progress bar and cancel. Nothing is copied until you click Copy,
-and existing files are never overwritten.
+and existing files are never overwritten. The compiled dir's VQ-VAE crop cache
+(`concat_vqvae_cache.pt` + `concat_vqvae_cache_metadata.parquet`) is left out
+unless its own checkbox — unticked by default — is ticked.
 
 The three paths are machine-specific constants at the top of the script — edit
 them when running on a different computer. The analysis wizard uses them too:

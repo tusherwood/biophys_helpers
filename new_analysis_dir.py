@@ -57,6 +57,16 @@ TARGETS = (
     Target("gating summary", "*_gating_summary", "gating"),
 )
 
+# The concatenated VQ-VAE crop cache inside a *_compiled dir (written by
+# compile_experiment.py). Often GBs, so it is left out of the copy unless its
+# own checkbox (off by default) is ticked.
+VQVAE_CACHE_FILES = ("concat_vqvae_cache.pt", "concat_vqvae_cache_metadata.parquet")
+
+
+def vqvae_cache_files(compiled_dir):
+    """The crop-cache files present directly inside compiled_dir."""
+    return [compiled_dir / n for n in VQVAE_CACHE_FILES if (compiled_dir / n).is_file()]
+
 
 def name_error(name):
     """Return why `name` is unusable as an analysis dir name, or None if it's fine."""
@@ -97,11 +107,13 @@ def fmt_bytes(n):
     return f"{n:.1f} TB"
 
 
-def copy_trees(jobs, msgs, cancel):
+def copy_trees(jobs, msgs, cancel, skip=()):
     """Copy each (src_dir, dest_dir) tree's contents into dest_dir, posting progress to msgs.
 
-    Runs on a worker thread. Never overwrites: an existing destination file is an error.
+    Files whose source path is in `skip` are left out. Runs on a worker thread.
+    Never overwrites: an existing destination file is an error.
     """
+    skip = {Path(p) for p in skip}
     try:
         files = []
         for src, dest in jobs:
@@ -110,6 +122,8 @@ def copy_trees(jobs, msgs, cancel):
                 (dest / rel).mkdir(parents=True, exist_ok=True)
                 for nm in names:
                     s = Path(root) / nm
+                    if s in skip:
+                        continue
                     files.append((s, dest / rel / nm, s.stat().st_size))
         total = sum(size for *_, size in files)
 
@@ -150,6 +164,7 @@ class NewAnalysisPanel(ttk.Frame):
         self.data_dir = None
         self.rows = []  # (target, enabled BooleanVar, candidates, Combobox|None, size Label)
         self.size_cache = {}
+        self.skipped = []  # source files the last copy left out (see skipped_files)
         self.msgs = queue.Queue()
         self.cancel = threading.Event()
         self.worker = None
@@ -357,6 +372,14 @@ class NewAnalysisPanel(ttk.Frame):
                 self.update_size(len(self.rows) - 1)
 
         n = len(TARGETS) + 1
+        # The crop cache inside the compiled dir: its own checkbox, off by default.
+        self.cache_var = tk.BooleanVar(value=False)
+        self.cache_chk = ttk.Checkbutton(f, text="VQ-VAE crop cache", variable=self.cache_var)
+        self.cache_chk.grid(row=n, column=0, sticky="w", padx=(20, 10), pady=2)
+        self.cache_lbl = ttk.Label(f, text="", foreground="gray30")
+        self.cache_lbl.grid(row=n, column=1, columnspan=3, sticky="w", pady=2)
+        self.update_cache_row()
+        n += 1
         ttk.Label(f, text=f"Destination: {self.data_dir}", foreground="gray30").grid(
             row=n, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
@@ -394,10 +417,41 @@ class NewAnalysisPanel(ttk.Frame):
         n_files, n_bytes = self.size_cache[path]
         extra = f", {len(self.rows[row][2])} matches" if len(self.rows[row][2]) > 1 else ""
         self.rows[row][4].config(text=f"{n_files} files, {fmt_bytes(n_bytes)}{extra}")
+        self.update_cache_row()
+
+    def _compiled_source(self):
+        """The selected *_compiled dir if that row is ticked, else None."""
+        for i, (t, var, cands, _combo, _lbl) in enumerate(self.rows):
+            if t.pattern == "*_compiled" and cands and var.get():
+                return self.selected(i)
+        return None
+
+    def update_cache_row(self):
+        if not hasattr(self, "cache_chk"):
+            return     # still building the rows
+        compiled = self._compiled_source()
+        files = vqvae_cache_files(compiled) if compiled is not None else []
+        if not files:
+            self.cache_chk.state(["disabled"])
+            self.cache_lbl.config(text="not copied (compiled not ticked)" if compiled is None
+                                  else "none in the selected compiled dir")
+            return
+        self.cache_chk.state(["!disabled"])
+        size = sum(p.stat().st_size for p in files)
+        self.cache_lbl.config(text=f"{fmt_bytes(size)} inside {compiled.name}; "
+                                   f"unticked, compiled is copied without it")
+
+    def skipped_files(self):
+        """Source files the copy leaves out (the crop cache unless ticked)."""
+        compiled = self._compiled_source()
+        if compiled is None or self.cache_var.get():
+            return []
+        return vqvae_cache_files(compiled)
 
     def refresh_copy_btn(self):
         ok = any(var.get() for _, var, *_ in self.rows)
         self.copy_btn.state(["!disabled"] if ok else ["disabled"])
+        self.update_cache_row()
 
     # ------------------------------------------------------------------ copy --
     def start_copy(self):
@@ -406,6 +460,7 @@ class NewAnalysisPanel(ttk.Frame):
         if not jobs:
             return
         self.jobs = jobs
+        self.skipped = self.skipped_files()
         for w in self.disc.winfo_children():
             self._set_enabled(w, False)
         self.close_btn.state(["!disabled"])
@@ -413,7 +468,8 @@ class NewAnalysisPanel(ttk.Frame):
         self.cancel_btn.grid(row=0, column=1, padx=(0, 6))
         self.cancel_btn.state(["!disabled"])
         self.status.config(text="Scanning...")
-        self.worker = threading.Thread(target=copy_trees, args=(jobs, self.msgs, self.cancel),
+        self.worker = threading.Thread(target=copy_trees,
+                                       args=(jobs, self.msgs, self.cancel, self.skipped),
                                        daemon=True)
         tk_gc.pause()     # GC stays on Tk's thread while the worker runs
         self.worker.start()

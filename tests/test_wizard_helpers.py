@@ -113,5 +113,23 @@ class CalibrationAndNewestTests(unittest.TestCase):
             self.assertEqual(aw.newest_raw_experiment(root).name, '2026-11-03_b')
 
 
+class CopySkipTests(unittest.TestCase):
+    def test_copy_trees_leaves_out_skipped_files(self):
+        import queue
+        import threading
+        import new_analysis_dir as nad
+        with tempfile.TemporaryDirectory() as tmp:
+            src, dest = Path(tmp) / 'x_compiled', Path(tmp) / 'out'
+            src.mkdir()
+            (src / 'experiment_data.xlsx').write_text('a')
+            for n in nad.VQVAE_CACHE_FILES:
+                (src / n).write_text('b')
+            self.assertEqual(len(nad.vqvae_cache_files(src)), 2)
+            msgs = queue.Queue()
+            nad.copy_trees([(src, dest)], msgs, threading.Event(),
+                           skip=nad.vqvae_cache_files(src))
+            self.assertEqual(sorted(p.name for p in dest.iterdir()), ['experiment_data.xlsx'])
+
+
 if __name__ == '__main__':
     unittest.main()
