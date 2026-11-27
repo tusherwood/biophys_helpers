@@ -464,6 +464,8 @@ class BaselineDensityGUI(ttk.Frame):
         ttk.Button(button_bar, text='Select All', command=self._select_all).pack(side=tk.LEFT)
         ttk.Button(button_bar, text='Select None', command=self._select_none).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(button_bar, text='Invert Selection', command=self._invert_selection).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(button_bar, text='Select Uncategorized',
+                   command=self._select_uncategorized).pack(side=tk.LEFT, padx=(6, 0))
         # Category assignment of the ticked samples (rows are then coloured by
         # category; see the sidebar).
         ttk.Button(button_bar, text='Remove Selection from Category',
@@ -768,6 +770,12 @@ class BaselineDensityGUI(ttk.Frame):
     def _invert_selection(self):
         for iid, value in self._checked.items():
             self._set_checked(iid, not value)
+        self._update_average()
+
+    def _select_uncategorized(self):
+        """Tick exactly the samples not in any category (Skip counts as one)."""
+        for iid, name in self._names.items():
+            self._set_checked(iid, self._model.category_of(name) is None)
         self._update_average()
 
     def _update_average(self):

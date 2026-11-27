@@ -11,9 +11,13 @@ Stages (keys) and what counts as done:
     mass      every sample has a *_mass_results dir (the MATLAB SMR analysis,
               run outside the wizard; partial is normal for FXM-only samples)
     baseline  a *_baseline_density.csv exists and density_categories.json
-              puts every sample with mass results in a category
+              puts every sample with mass results in a category -- except
+              samples whose imaging is already complete at some density
+              (analysed outside the category flow), which need none; when
+              every sample is like that the stage is done without a CSV
     imaging   every non-Skip category analysed at its own density
-              (density_categories.sample_analysis_status, read from the HDF5s)
+              (density_categories.sample_analysis_status, read from the HDF5s),
+              and every uncategorised sample with imaging data analysed
     gating    every sample with mass or imaging data has a gate file
     compile   a *_compiled dir exists, and nothing it depends on (gate files,
               the samples' newest CELLGROUPED HDF5s, compile_annotations.json)
@@ -153,25 +157,43 @@ def scan(superdir) -> dict:
     csvs = sorted(f.name for f in superdir.glob('*_baseline_density.csv')
                   if _BASELINE_CSV_RE.match(f.name))
     cats = _load_categories(superdir)
-    if not csvs:
+    assigned = {s for c in (cats or []) for s in c.get('samples', [])}
+    # Uncategorised samples whose imaging is already complete (analysed at some
+    # density outside the category flow) need no category.
+    uncat_imaging = [s for s in samples if s.name not in assigned and has_imaging(s)]
+    analysed_elsewhere = {s.name for s in uncat_imaging if dc.sample_fully_analysed(s)}
+    n_mass = len(mass_samples)
+    n_assigned = sum(1 for s in mass_samples if s.name in assigned)
+    n_covered = sum(1 for s in mass_samples if s.name in assigned or s.name in analysed_elsewhere)
+    n_cats = sum(1 for c in (cats or []) if not c.get('skip'))
+    cats_text = f'{n_cats} categor{"y" if n_cats == 1 else "ies"}'
+    elsewhere_text = (f'{len(analysed_elsewhere)} already analysed without a category'
+                      if analysed_elsewhere else '')
+    if n_mass and n_covered == n_mass and (csvs or n_assigned == 0):
+        if csvs:
+            detail = '; '.join(t for t in (csvs[-1], cats_text if n_assigned else '',
+                                           elsewhere_text) if t)
+        else:
+            detail = f'not needed: all {n_mass} samples already analysed'
+        out['baseline'] = StageStatus('baseline', DONE, detail)
+    elif not csvs:
         out['baseline'] = StageStatus('baseline', TODO, 'not calculated yet')
     else:
-        assigned = {s for c in (cats or []) for s in c.get('samples', [])}
-        n_mass = len(mass_samples)
-        n_assigned = sum(1 for s in mass_samples if s.name in assigned)
-        if n_mass and n_assigned == n_mass:
-            n_cats = sum(1 for c in cats if not c.get('skip'))
-            out['baseline'] = StageStatus('baseline', DONE,
-                                          f'{csvs[-1]}; {n_cats} categor{"y" if n_cats == 1 else "ies"}')
-        else:
-            out['baseline'] = StageStatus('baseline', PARTIAL,
-                                          f'calculated; {n_assigned}/{n_mass} samples categorised')
+        out['baseline'] = StageStatus(
+            'baseline', PARTIAL, f'calculated; {n_covered}/{n_mass} samples categorised'
+            + (f' or analysed ({len(analysed_elsewhere)} without a category)'
+               if analysed_elsewhere else ''))
 
     # imaging, per category at its own density
     analysis_cats = [c for c in (cats or []) if not c.get('skip') and c.get('samples')
                      and c.get('mean_density_g_per_mL') is not None]
-    if not analysis_cats:
+    n_elsewhere, n_uncat = len(analysed_elsewhere), len(uncat_imaging)
+    elsewhere_text = f'{n_elsewhere}/{n_uncat} uncategorised samples analysed' if n_uncat else ''
+    if not analysis_cats and not n_elsewhere:
         out['imaging'] = StageStatus('imaging', TODO, 'no density categories yet')
+    elif not analysis_cats:
+        out['imaging'] = StageStatus('imaging', DONE if n_elsewhere == n_uncat else PARTIAL,
+                                     elsewhere_text)
     else:
         done, rerun = 0, 0
         for c in analysis_cats:
@@ -183,8 +205,11 @@ def scan(superdir) -> dict:
                 done += 1
         n = len(analysis_cats)
         detail = f'{done}/{n} categories analysed' + (f', {rerun} need a rerun' if rerun else '')
-        out['imaging'] = StageStatus('imaging', DONE if done == n else PARTIAL if done or rerun
-                                     else TODO, detail)
+        if n_elsewhere:
+            detail += f'; {elsewhere_text}'
+        all_done = done == n and n_elsewhere == n_uncat
+        out['imaging'] = StageStatus('imaging', DONE if all_done else PARTIAL
+                                     if done or rerun or n_elsewhere else TODO, detail)
 
     # gating
     gate_files = {s.name: find_gate_file(s) for s in samples}

@@ -444,6 +444,13 @@ def _attr_text(value) -> str:
     return str(value).strip().strip('"')
 
 
+def sample_fully_analysed(sample_dir: Path) -> bool:
+    """Whether a sample's newest imaging run is complete at *some* media
+    density (or BF-only complete) -- e.g. analysed outside the category flow."""
+    _run, hdf5s = _latest_run_hdf5s(sample_dir)
+    return bool(hdf5s) and all(_inspect_hdf5(p)[0] in ('density', 'bf_ok') for p in hdf5s)
+
+
 def sample_analysis_status(sample_dir: Path, expected_density: float) -> SampleStatus:
     """Whether a sample's newest imaging run is complete at `expected_density`."""
     if not _has_image_binaries(sample_dir):

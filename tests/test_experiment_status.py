@@ -64,6 +64,27 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(st['compile'].state, es.STALE)
         self.assertIn('gates', st['compile'].detail)
 
+    def test_samples_analysed_outside_categories_skip_baseline(self):
+        from unittest import mock
+        for s in ('s1_rep1', 's2_rep1'):
+            (self.sup / s / '20260101.130000_imaging_fxm_results').mkdir()
+        with mock.patch.object(es.dc, 'sample_fully_analysed', return_value=True):
+            st = es.scan(self.sup)            # no CSV, no categories
+            self.assertEqual(st['baseline'].state, es.DONE)
+            self.assertEqual(st['imaging'].state, es.DONE)
+            self.assertEqual(es.first_unfinished(st), 'gating')
+            _touch(self.sup / '20260101_140000_baseline_density.csv', 'sample\n')
+            _touch(self.sup / 'density_categories.json', json.dumps({'categories': [
+                {'name': 'A', 'skip': False, 'samples': ['s1_rep1'], 'mean_density_g_per_mL': 1.0}]}))
+            st = es.scan(self.sup)            # s2 uncategorised but analysed
+            self.assertEqual(st['baseline'].state, es.DONE)
+            self.assertIn('1 already analysed', st['baseline'].detail)
+        with mock.patch.object(es.dc, 'sample_fully_analysed', return_value=False):
+            st = es.scan(self.sup)            # s2 still needs a category
+            self.assertEqual(st['baseline'].state, es.PARTIAL)
+            self.assertNotEqual(st['imaging'].state, es.DONE)
+            self.assertEqual(es.first_unfinished(st), 'baseline')
+
     def test_resume_goes_past_the_furthest_done_stage(self):
         S = es.StageStatus
         st = {'baseline': S('baseline', es.PARTIAL, ''), 'imaging': S('imaging', es.TODO, ''),
