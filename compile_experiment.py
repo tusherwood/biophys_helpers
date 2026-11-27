@@ -168,6 +168,7 @@ from gating.gates import (GATE_KEYS, MASS_GATE_COLUMNS, MASS_GATE_KEYS,
 # byte-identical to what `python concat_vqvae_caches.py <superdir>` produces.
 # It imports no torch and no GUI, so this costs nothing at import time.
 import concat_vqvae_caches as cvc
+import tk_gc
 
 
 # ---------------------------------------------------------------------------
@@ -2239,8 +2240,10 @@ def build_embedded_page(parent: tk.Widget, *,
                     else:
                         finished = msg
                 if finished is None:
+                    tk_gc.tick()
                     page.after(100, poll)
                     return
+                tk_gc.resume()
                 _set_busy(False)
                 if finished[0] == 'error':
                     _set_status(f'Compile failed: {finished[1]} — fix the problem and click '
@@ -2265,6 +2268,8 @@ def build_embedded_page(parent: tk.Widget, *,
                 if on_done is not None:
                     on_done()
 
+            # GC stays on Tk's thread while the worker runs (see tk_gc).
+            tk_gc.pause()
             threading.Thread(target=work, daemon=True).start()
             page.after(100, poll)
 

@@ -1479,5 +1479,6 @@ These are imported by the scripts above and are not run directly.
 | [`analysis_log.py`](analysis_log.py) | Appends the wizard's checkpoints to `<experiment>/analysis_log.md`. |
 | [`user_state.py`](user_state.py) | The per-user settings file `~/.biophys_helpers/wizard_state.json` (recent experiments, window layout, last calibration, …). |
 | [`desktop_notify.py`](desktop_notify.py) | Stdlib-only notification sound, taskbar flash and on-screen check for the Tk GUIs (Windows; no-ops elsewhere). |
+| [`tk_gc.py`](tk_gc.py) | Keeps garbage collection on Tk's thread while a worker thread runs (compile write, sample QC load, analysis-dir copy), so leftover Tk objects aren't finalized off-thread ("main thread is not in main loop" console errors). |
 | [`pipeline/stage2/pairing_utils.py`](pipeline/stage2/pairing_utils.py) | Cross-correlation pairing primitives (SciPy-based signal building, lag estimation, peak matching) used only by the [deprecated](#deprecated) pairing scripts. |
 | [`fsutil.py`](fsutil.py) | Stdlib-only filesystem helpers shared across scripts. `is_appledouble()` detects macOS AppleDouble sidecars (`._*`) so scans of exFAT/FAT external drives skip them. |

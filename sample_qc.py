@@ -37,6 +37,7 @@ from tkinter import ttk
 
 import density_categories as dc
 import experiment_status as es
+import tk_gc
 
 FEW_CELLS = 100
 LOW_PAIRING_ABS = 0.20
@@ -304,15 +305,18 @@ class QCPage(ttk.Frame):
             except Exception as exc:     # shown in the page, not lost on the thread
                 result['error'] = f'{type(exc).__name__}: {exc}'
 
+        tk_gc.pause()     # GC stays on Tk's thread while the worker runs
         self._job = threading.Thread(target=work, daemon=True)
         self._job.start()
         self.after(150, lambda: self._poll(result))
 
     def _poll(self, result: dict):
         if self._job is not None and self._job.is_alive():
+            tk_gc.tick()
             self.after(150, lambda: self._poll(result))
             return
         self._job = None
+        tk_gc.resume()
         self._progress.stop()
         self._progress.pack_forget()
         if 'error' in result:

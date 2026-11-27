@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+import tk_gc
+
 BIOPHYS_CODE_DIR = Path(r"C:\thomasu\code\scratch\biophys_data_analysis")
 DATA_ANALYSIS_DIR = Path(r"C:\Users\thomasu\MIT Dropbox\Thomas Usherwood\data_analysis")
 RAW_DATA_DIR = Path(r"D:\raw_data")
@@ -413,6 +415,7 @@ class NewAnalysisPanel(ttk.Frame):
         self.status.config(text="Scanning...")
         self.worker = threading.Thread(target=copy_trees, args=(jobs, self.msgs, self.cancel),
                                        daemon=True)
+        tk_gc.pause()     # GC stays on Tk's thread while the worker runs
         self.worker.start()
         self.poll()
 
@@ -443,9 +446,11 @@ class NewAnalysisPanel(ttk.Frame):
             self.status.config(text=f"{self.cur_bytes}   {self.cur_file}")
 
         if finished is None:
+            tk_gc.tick()
             self.after(100, self.poll)
             return
 
+        tk_gc.resume()
         self.cancel_btn.grid_remove()
         kind = finished[0]
         if kind == "done":
