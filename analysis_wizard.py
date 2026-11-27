@@ -308,6 +308,7 @@ class Wizard:
                           again by mark_incomplete(index)) — unless
                           finalize_satisfied() returns True.
         finalize_satisfied: optional callable() -> bool; see above.
+        finalize_hint:    text shown beside Next until the step is complete.
         satisfied_hint:   text shown when finalize_satisfied lets Next through.
         next_check:       optional callable() -> bool; Next stays disabled
                           on this step whenever it returns False (checked
@@ -598,7 +599,7 @@ class Wizard:
         hint = ''
         if has_next and not ready:
             if not self._finalize_ok(index):
-                hint = 'Click "Finalize gating" below to continue.'
+                hint = step.get('finalize_hint', 'Complete this step to continue.')
             else:
                 hint = step.get('next_hint', 'Complete this step to continue.')
                 if callable(hint):
@@ -1100,6 +1101,7 @@ def main():
 
     STAGE_STEPS = {'baseline': 1, 'imaging': 2, 'gating': 3, 'compile': 5, 'new_dir': 6}
     SUMMARY_STEP = 7
+    COMPILE_STEP = STAGE_STEPS['compile']
 
     def wiz_():
         return wiz_holder[0] if wiz_holder else None
@@ -1272,6 +1274,7 @@ def main():
 
     def _gating_finalized():
         wiz.mark_complete(3)
+        wiz.mark_incomplete(COMPILE_STEP)    # new gates -> compile again
         wiz.refresh_status()
         st = wiz.status.get('gating')
         _log('Gating finalized', st.detail if st is not None else 'gate files written')
@@ -1311,6 +1314,7 @@ def main():
     # -- step 6: compile ------------------------------------------------------
 
     def _compiled():
+        wiz.mark_complete(COMPILE_STEP)
         wiz.refresh_status()
         wiz.go_next()
 
@@ -1418,6 +1422,7 @@ def main():
          'refresh': lambda: pages['review'].refresh_status()},
         {'title': 'Gating: Buoyant Mass + Volume', 'builder': build_gating, 'stage': 'gating',
          'requires_finalize': True, 'finalize_satisfied': _gates_on_disk,
+         'finalize_hint': 'Click "Finalize gating" below to continue.',
          'satisfied_hint': 'Every sample already has a gate file — Next keeps them; '
                            'Finalize to replace them.',
          'on_leave': _leave_gating, 'primary': lambda: pages['gating'].primary_action()},
@@ -1426,6 +1431,10 @@ def main():
          'primary': lambda: pages['qc'].refresh(force=True),
          'refresh': lambda: pages['qc'].refresh()},
         {'title': 'Compile Experiment', 'builder': build_compile, 'stage': 'compile',
+         # Next only after Done has compiled in this session (an existing
+         # compiled dir on disk doesn't count).
+         'requires_finalize': True,
+         'finalize_hint': 'Click "Done" below to compile; Next unlocks once it finishes.',
          'primary': lambda: pages['compile'].primary_action()},
         {'title': 'New Analysis Dir', 'builder': build_new_analysis_dir, 'stage': 'new_dir',
          'primary': lambda: pages['new_dir'].primary_action()},
@@ -1448,6 +1457,7 @@ def main():
     def _on_dir_changed():
         pending[0] = None
         sd = _superdir_path()
+        wiz.mark_incomplete(COMPILE_STEP)    # another experiment: compile it first
         if sd is not None:
             user_state.add_recent_experiment(sd)
             wiz.prebuild(1)

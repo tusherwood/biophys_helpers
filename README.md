@@ -225,7 +225,9 @@ sessions, along with the window layout (see *Remembered settings* below).
    crop cache in the background with a progress bar and the current step (sample
    *n*/*N*, crop cache); the wizard's navigation is locked until it finishes (closing
    the window asks first), an error is shown on the page with Done re-enabled, and a
-   successful compile advances.
+   successful compile advances. Next needs a successful **Done** in this session — an
+   existing compiled folder on disk doesn't count, and finalizing new gates or
+   switching experiments locks it again. The sidebar can still jump ahead.
 7. **New analysis dir** — `new_analysis_dir.py`'s GUI, using the shared directory as
    its raw data dir (no list picker): **Create** scaffolds the code and
    data_analysis dirs named after it, then offers to copy in its `*_compiled` and
